@@ -1,485 +1,2443 @@
-"""ROGII exp026 — PF × geom self-contained blend (Kaggle Notebook submission).
+# %% [code]
+# ROGII dynamic sp45 projection + fleongg pretrained blend
+# Generated locally for Kaggle code submission.
 
-最終best(ローカル)= PF(GR-typewell系列トラッカー) × geom(幾何外挿LightGBM) の NNLSブレンド+平滑。
-本kernelは PF と geom を **raw CSVから自己完結で再計算**して提出する。
 
-CV (local, leak-free nested-fold):
-  PF(tuned) 10.984 / geom(exp014) 13.525 → 0.683*PF + 0.392*geom + 平滑(w101) = 10.106
+# %% markdown 1: # ROGII - Wellbore Geology Prediction **Reference:** - [rogii-sel15-rerun](https://www.kaggle.com/code/aidensong123/rogii-sel15-rerun) - [[ROGII] BETTER SOLUTION | LB: 9.956](https://www.kaggle.com/code/romantamrazov/rogii-better-solution-l
 
-構成:
-  geom : SAFE + Group A/B/C/D(GR rolling) + Group F(幾何外挿) を LightGBM delta回帰
-         (5-fold GroupKFold-by-well, test=5fold平均)。exp014相当。
-  PF   : 各test wellで typewell GR-TVTプロファイルに対し状態 pos=TVT+Z を粒子フィルタ追跡
-         (init_spread=4, PN=0.01, 128seed×500粒子, 尤度加重)。tuned config。
-  blend: anchor + 0.683*(PF-anchor) + 0.392*(geom-anchor) → well内 row順 mean平滑(w=101)。
 
-leak-free: hidden TVT不使用。GR/typewell/anchor/既知幾何(X/Y/Z/MD)のみ。
-"""
+# %% markdown 2: # 1. Imports and configs
+
+
+# %% cell 3
+import sys, os, glob, subprocess
+# koolbox setup: wheel install or sys.path fallback
+kb_dir = '/kaggle/input/koolbox-offline'
+if not os.path.isdir(kb_dir):
+    # alt path under datasets/
+    cand = glob.glob('/kaggle/input/**/koolbox*', recursive=True)
+    print('koolbox candidates:', cand[:5])
+    if cand: kb_dir = cand[0]
+print('using koolbox dir:', kb_dir)
+if os.path.isdir(kb_dir):
+    print('listing:', os.listdir(kb_dir)[:20])
+    whls = glob.glob(f'{kb_dir}/**/*.whl', recursive=True)
+    if whls:
+        for w in whls:
+            print('install', w)
+            subprocess.run(['pip', 'install', '--no-deps', w], check=False)
+    else:
+        sys.path.insert(0, kb_dir)
+        # also try subdirs
+        for sub in os.listdir(kb_dir):
+            sub_path = os.path.join(kb_dir, sub)
+            if os.path.isdir(sub_path):
+                sys.path.insert(0, sub_path)
+import koolbox
+print('koolbox OK:', koolbox.__file__)
+
+
+# %% cell 4
+from lightgbm import LGBMRegressor, log_evaluation, early_stopping
+from sklearn.metrics import root_mean_squared_error
+from sklearn.model_selection import GroupKFold
+from sklearn.linear_model import Ridge
+from catboost import CatBoostRegressor
+from scipy.spatial import cKDTree
+from scipy.signal import savgol_filter
+from joblib import Parallel, delayed
+from koolbox import Trainer
 from pathlib import Path
-import re
+from numba import njit
+import matplotlib.pyplot as plt
+import multiprocessing
+import seaborn as sns
+import pandas as pd
+import numpy as np
+import warnings
+import joblib
+import time
+import glob
 import os
-from concurrent.futures import ProcessPoolExecutor
 
-import lightgbm as lgb
+warnings.filterwarnings("ignore")
+
+# %% cell 5
+class CFG:
+    dataset_path = Path("/kaggle/input/competitions/rogii-wellbore-geology-prediction")
+    artifacts_path = Path("/kaggle/input/datasets/ravaghi/wellbore-geology-prediction-artifacts")
+    
+    seed = 42
+    n_splits = 5
+    cv = GroupKFold(n_splits=n_splits)
+    
+    metric = root_mean_squared_error
+
+# %% markdown 6: # 2. Data loading and preprocessing
+
+
+# %% cell 7
+SELECTOR_N_EVAL_THRESHOLD = 4840.0
+SELECTOR_Z_SPAN_THRESHOLDS = (136.73000000000016, 185.5133333333342)
+
+SELECTOR_BIN_VARIANTS = {
+    0: 'pf_scale_5_hold_0.2',
+    1: 'pf_scale_3_hold_0.15',
+    2: 'pf_scale_12_beam_0.2_hold_0.15',
+    3: 'pf_scale_5_hold_0.15',
+    4: 'pf_scale_5_beam_0.05_hold_0.05',
+    5: 'pf_scale_12_beam_0.2_hold_0.05',
+}
+
+SELECTOR_GLOBAL_VARIANT = 'pf_scale_8_hold_0.2'
+SELECTOR_SCALES = (3.0, 5.0, 8.0, 12.0)
+
+FORMATION_COLS = ['ANCC', 'ASTNU', 'ASTNL', 'EGFDU', 'EGFDL', 'BUDA']
+
+BEAM_CONFIGS = [
+    (10, 20.0, 144.0, 2),
+    (10,  8.0,  64.0, 2),
+    ( 8, 35.0, 220.0, 1),
+    (10, 14.0,  90.0, 5),
+    (20,  4.0,  36.0, 3),
+    (12, 12.0, 100.0, 3),
+    (15, 25.0, 180.0, 2),
+    (20, 30.0, 200.0, 2),
+    (15, 10.0,  80.0, 4),
+    (25,  6.0,  50.0, 3),
+    (10, 40.0, 300.0, 1),
+    (12, 18.0, 120.0, 5),
+    (30,  8.0,  70.0, 2),
+    (10, 50.0, 400.0, 0),
+]
+
+
+def tvt_from_contacts(hw_tr, tw_tr, ref_col='EGFDU'):
+    tw_g = tw_tr.dropna(subset=['Geology'])
+    ref_tvt = tw_g[tw_g['Geology'] == ref_col]['TVT'].min()
+    if np.isnan(ref_tvt):
+        ref_col = tw_g['Geology'].iloc[0]
+        ref_tvt = tw_g[tw_g['Geology'] == ref_col]['TVT'].min()
+    offset = (hw_tr['TVT'] - (ref_tvt - (hw_tr['Z'] - hw_tr[ref_col]))).mean()
+    return ref_tvt - (hw_tr['Z'] - hw_tr[ref_col]) + offset
+
+
+def load_well(wid, split='train'):
+    base = CFG.dataset_path / split
+    hw = pd.read_csv(base / f'{wid}__horizontal_well.csv')
+    tw = pd.read_csv(base / f'{wid}__typewell.csv')
+    return hw, tw
+
+
+def run_particle_filter(hw, tw, n_particles=500, seed=42):
+    tw_s   = tw.sort_values('TVT')
+    tw_tvt = tw_s['TVT'].values.astype(float)
+    tw_gr  = tw_s['GR'].fillna(tw_s['GR'].mean()).values.astype(float)
+
+    kn = hw[hw['TVT_input'].notna()]
+    ev = hw[hw['TVT_input'].isna()]
+    if len(ev) == 0:
+        return hw['TVT_input'].values.astype(float).copy(), 0.0
+
+    last     = kn.iloc[-1]
+    last_tvt = float(last['TVT_input'])
+    last_Z   = float(last['Z'])
+    last_MD  = float(last['MD'])
+
+    tw_at_k = np.interp(kn['TVT_input'].values, tw_tvt, tw_gr)
+    gs = float(np.clip(np.nanstd(kn['GR'].fillna(0).values - tw_at_k), 10., 60.))
+
+    tail = kn.tail(30)
+    dt = np.diff(tail['TVT_input'].values)
+    dz = np.diff(tail['Z'].values)
+    dm = np.diff(tail['MD'].values)
+    m  = dm > 0
+    ir = float(np.median((dt + dz)[m] / dm[m])) if m.sum() >= 3 else 0.0
+
+    N   = n_particles
+    rng = np.random.default_rng(seed)
+    ls   = last_tvt + last_Z
+    pos  = ls + 4.5 * rng.standard_normal(N)  # sp45 patch (sel15 vb best)
+    rate = ir + 0.01 * rng.standard_normal(N)
+    w    = np.ones(N) / N
+
+    MOM = 0.998; VN = 0.002; PN = 0.005; RP = 0.1; RR = 0.001; RESAMP = 0.5
+
+    md_v = ev['MD'].values.astype(float)
+    z_v  = ev['Z'].values.astype(float)
+    # Interpolate GR gaps before tracking
+    gr_interp = hw['GR'].interpolate(limit_direction='both').fillna(tw_gr.mean())
+    gr_v = gr_interp.values.astype(float)[ev.index]
+
+    out_vals = hw['TVT_input'].values.astype(float).copy()
+    res = np.empty(len(ev))
+    prev_MD = last_MD
+    log_lik = 0.0
+
+    for i in range(len(ev)):
+        dm_step = max(md_v[i] - prev_MD, 1.0)
+        rate = MOM * rate + VN * rng.standard_normal(N)
+        pos  = pos + rate * dm_step + PN * rng.standard_normal(N)
+        tvt_p = pos - z_v[i]
+        tvt_p = np.clip(tvt_p, tw_tvt[0] - 100, tw_tvt[-1] + 100)
+        pos   = tvt_p + z_v[i]
+
+        eg = np.interp(tvt_p, tw_tvt, tw_gr)
+        d  = (gr_v[i] - eg) / gs
+        lk = np.exp(-0.5 * np.minimum(d**2, 600.))
+        lk = np.maximum(lk, 1e-300)
+        avg_lk = float((w * lk).sum())
+        log_lik += np.log(max(avg_lk, 1e-300))
+        w = w * lk
+        ws = w.sum()
+        w = w / ws if ws > 0 else np.ones(N) / N
+
+        n_eff = 1.0 / (w**2).sum()
+        if n_eff < RESAMP * N:
+            cum = np.cumsum(w)
+            u0  = rng.uniform(0, 1.0 / N)
+            idx = np.clip(np.searchsorted(cum, u0 + np.arange(N) / N), 0, N - 1)
+            pos  = pos[idx]  + RP * rng.standard_normal(N)
+            rate = rate[idx] + RR * rng.standard_normal(N)
+            w    = np.ones(N) / N
+
+        res[i] = float(np.dot(w, pos - z_v[i]))
+        prev_MD = md_v[i]
+
+    out_vals[list(ev.index)] = res
+    return out_vals, log_lik
+
+
+def run_pf_lik_ensemble(hw, tw, n_particles=500, n_seeds=128, scale=5.0):
+    preds = []
+    liks  = []
+    for s in range(n_seeds):
+        p, ll = run_particle_filter(hw, tw, n_particles=n_particles, seed=s)
+        preds.append(p)
+        liks.append(ll)
+
+    liks   = np.array(liks)
+    liks_n = liks - liks.max()
+    weights = np.exp(liks_n / scale)
+    weights /= weights.sum()
+
+    return (weights[:, None] * np.stack(preds, 0)).sum(0)
+
+
+def run_pf_lik_ensemble_scales(hw, tw, scales=SELECTOR_SCALES, n_particles=500, n_seeds=128):
+    preds = []
+    liks = []
+    for s in range(n_seeds):
+        p, ll = run_particle_filter(hw, tw, n_particles=n_particles, seed=s)
+        preds.append(p)
+        liks.append(ll)
+    pred_arr = np.stack(preds, 0)
+    liks = np.array(liks)
+    liks_n = liks - liks.max()
+    out = {}
+    for scale in scales:
+        weights = np.exp(liks_n / float(scale))
+        weights /= weights.sum()
+        out[f'pf_scale_{scale:g}'] = (weights[:, None] * pred_arr).sum(0)
+    out['pf_mean'] = pred_arr.mean(0)
+    return out
+
+
+def beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs=10, mc=20.0, es=144.0, r=2):
+    n  = len(hgr)
+    nt = len(tw_tvt)
+    if n == 0:
+        return np.array([last_tvt])
+
+    if r > 0 and n > max(3, 2 * r + 1):
+        win = min(2 * r + 1, n if n % 2 == 1 else n - 1)
+        sgr = savgol_filter(hgr, win, min(2, win - 1))
+    else:
+        sgr = hgr.copy()
+
+    si = int(np.argmin(np.abs(tw_tvt - last_tvt)))
+
+    MOVES = np.array([-2, -1, 0, 1, 2], dtype=np.int64)
+    MC    = mc * np.array([2., 1., 0., 1., 2.])
+
+    bidx  = np.full(bs, si, dtype=np.int64)
+    bcost = np.full(bs, np.inf)
+    bcost[0] = 0.
+    bn = 1
+
+    result = np.zeros(n)
+
+    for step in range(n):
+        gv = sgr[step]
+        ni = bidx[:bn, None] + MOVES[None, :]
+        ci = np.clip(ni, 0, nt - 1)
+        valid = (ni >= 0) & (ni < nt)
+
+        gr_e = (gv - tw_gr[ci])**2 / es
+        tot  = bcost[:bn, None] + gr_e + MC[None, :]
+        tot  = np.where(valid, tot, np.inf)
+
+        ni_f  = ni.flatten()
+        tot_f = tot.flatten()
+        vf    = valid.flatten()
+        ni_f  = ni_f[vf]
+        tot_f = tot_f[vf]
+
+        order = np.argsort(tot_f)
+        ni_s  = ni_f[order]
+        tot_s = tot_f[order]
+
+        _, first = np.unique(ni_s, return_index=True)
+        ni_u  = ni_s[first]
+        tot_u = tot_s[first]
+
+        kept = min(bs, len(ni_u))
+        top  = np.argpartition(tot_u, min(kept - 1, len(tot_u) - 1))[:kept]
+        top  = top[np.argsort(tot_u[top])]
+
+        bidx[:kept]  = ni_u[top]
+        bcost[:kept] = tot_u[top]
+        if kept < bs:
+            bidx[kept:]  = bidx[kept - 1]
+            bcost[kept:] = np.inf
+        bn = kept
+
+        result[step] = tw_tvt[bidx[0]]
+
+    return result
+
+
+def run_beam_ensemble(hw, tw):
+    kn = hw[hw['TVT_input'].notna()]
+    ev = hw[hw['TVT_input'].isna()]
+    if len(ev) == 0:
+        return hw['TVT_input'].values.astype(float).copy()
+
+    last_tvt = float(kn.iloc[-1]['TVT_input'])
+    tw_s  = tw.sort_values('TVT')
+    tw_tvt = tw_s['TVT'].values.astype(float)
+    tw_gr  = tw_s['GR'].fillna(tw_s['GR'].mean()).values.astype(float)
+
+    gr_all = hw['GR'].interpolate(limit_direction='both').fillna(tw_gr.mean()).values.astype(float)
+    hgr    = gr_all[ev.index]
+
+    beam_results = [beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs, mc, es, r)
+                    for (bs, mc, es, r) in BEAM_CONFIGS]
+
+    beam_mean = np.stack(beam_results, 0).mean(0)
+
+    out = hw['TVT_input'].values.astype(float).copy()
+    out[list(ev.index)] = beam_mean
+    return out
+
+
+def selector_well_code(hw):
+    eval_mask = hw['TVT_input'].isna().to_numpy()
+    n_eval = float(eval_mask.sum())
+    z_eval = hw.loc[eval_mask, 'Z'].values.astype(float)
+    z_span = float(np.nanmax(z_eval) - np.nanmin(z_eval)) if len(z_eval) else 0.0
+    n_bin = int(n_eval > SELECTOR_N_EVAL_THRESHOLD)
+    z_bin = int(np.searchsorted(SELECTOR_Z_SPAN_THRESHOLDS, z_span, side='right'))
+    code = n_bin + 2 * z_bin
+    variant = SELECTOR_BIN_VARIANTS.get(code, SELECTOR_GLOBAL_VARIANT)
+    return code, variant, n_eval, z_span
+
+
+def parse_selector_variant(name):
+    parts = name.split('_')
+    scale = float(parts[2])
+    beam_weight = 0.0
+    hold_weight = 0.0
+    if 'beam' in parts:
+        beam_weight = float(parts[parts.index('beam') + 1])
+    if 'hold' in parts:
+        hold_weight = float(parts[parts.index('hold') + 1])
+    return scale, beam_weight, hold_weight
+
+
+def apply_selector_variant(name, pf_by_scale, tvt_beam, last_known_tvt):
+    scale, beam_weight, hold_weight = parse_selector_variant(name)
+    base = pf_by_scale.get(f'pf_scale_{scale:g}')
+    if base is None:
+        base = pf_by_scale[SELECTOR_GLOBAL_VARIANT.split('_beam_')[0].split('_hold_')[0]]
+    pred = (1.0 - beam_weight) * base + beam_weight * tvt_beam
+    pred = (1.0 - hold_weight) * pred + hold_weight * last_known_tvt
+    return pred
+
+# %% cell 8
+SEED=42
+NCPU=min(4,multiprocessing.cpu_count())
+
+FORMATIONS=["ANCC","ASTNU","ASTNL","EGFDU","EGFDL","BUDA"]
+PLANE_K=10; DENSE_SPW=60; DENSE_K=20; N_SPLITS=5
+
+BEAMS=[
+    (10,20.0,144.0,2,"cons"),
+    (10, 8.0, 64.0,2,"loose"),
+    ( 8,35.0,220.0,1,"vcons"),
+    (10,14.0, 90.0,5,"sm5"),
+    (20, 4.0, 36.0,3,"vloose"),
+    (12,12.0,100.0,3,"mid"),
+    (15,25.0,180.0,2,"stiff"),
+]
+
+PF_N=600; ANCC_N=600
+PF_MOM=0.993; PF_VN=0.005; PF_PN=0.01
+PF_GR_SIG_MIN=10.; PF_GR_SIG_MAX=60.; PF_GR_SIG_DEF=30.
+PF_INIT_V_STD=0.02; PF_INIT_SPR=0.5; PF_RESAMP=0.5
+PF_ROUGH_P=0.2; PF_ROUGH_V=0.003; PF_GR_WIN=5; PF_GR_WT=0.3
+ANCC_ALPHA=0.998; ANCC_RN=0.002; ANCC_PN=0.005
+ANCC_IR=0.01; ANCC_IS=0.3; ANCC_RP=0.1; ANCC_RR=0.001
+
+@njit(cache=True)
+def _interp1(grid, v, vmin, step):
+    i = int((v - vmin) / step)
+    if i < 0: return grid[0]
+    n = len(grid) - 1
+    if i >= n: return grid[n]
+    t = (v - vmin) / step - i
+    return grid[i]*(1.-t) + grid[i+1]*t
+
+@njit(cache=True)
+def _resamp(pos, aux, w, N, rp, rv):
+    cum = np.zeros(N+1)
+    for j in range(N): cum[j+1]=cum[j]+w[j]
+    u0=np.random.uniform(0.,1./N)
+    np2=np.empty(N); na=np.empty(N); ci=0
+    for j in range(N):
+        u=u0+j/N
+        while ci<N-1 and cum[ci+1]<u: ci+=1
+        np2[j]=pos[ci]+rp*np.random.randn()
+        na[j] =aux[ci]+rv*np.random.randn()
+    return np2,na
+
+@njit(cache=True)
+def _beam_jit(sgr, tw_gr, si, BS, mc, es):
+    """Beam search   2 delta, Numba JIT."""
+    n=len(sgr); nt=len(tw_gr); MAX=BS*6
+    bidx=np.zeros(BS,np.int64); bidx[0]=si
+    bcost=np.full(BS,1e30);     bcost[0]=0.; bn=np.int64(1)
+    hI=np.zeros((n,BS),np.int64); hP=np.zeros((n,BS),np.int64)
+    cI=np.zeros(MAX,np.int64); cC=np.full(MAX,1e30); cP=np.zeros(MAX,np.int64)
+    for step in range(n):
+        gv=sgr[step]; nc=np.int64(0)
+        for bi in range(bn):
+            idx=bidx[bi]; cost=bcost[bi]
+            for d in range(-2,3):            #   2: TVT can go down
+                ni=idx+d
+                if ni<0 or ni>=nt: continue
+                tot=cost+(gv-tw_gr[ni])**2/es+mc*(d if d>=0 else -d)
+                fnd=np.int64(-1)
+                for ci in range(nc):
+                    if cI[ci]==ni: fnd=ci; break
+                if fnd>=0:
+                    if tot<cC[fnd]: cC[fnd]=tot; cP[fnd]=bi
+                else:
+                    if nc<MAX: cI[nc]=ni; cC[nc]=tot; cP[nc]=bi; nc+=1
+        kept=min(BS,nc)
+        for i in range(kept):
+            mi=i
+            for j in range(i+1,nc):
+                if cC[j]<cC[mi]: mi=j
+            if mi!=i:
+                cI[i],cI[mi]=cI[mi],cI[i]
+                cC[i],cC[mi]=cC[mi],cC[i]
+                cP[i],cP[mi]=cP[mi],cP[i]
+        hI[step,:kept]=cI[:kept]; hP[step,:kept]=cP[:kept]
+        bidx[:kept]=cI[:kept]; bcost[:kept]=cC[:kept]; bn=kept
+    best=np.int64(0)
+    for b in range(1,bn):
+        if bcost[b]<bcost[best]: best=b
+    path=np.zeros(n,np.int64); b=best
+    for s in range(n-1,-1,-1): path[s]=hI[s,b]; b=hP[s,b]
+    return path
+
+@njit(cache=True)
+def _pf_ancc(md_v,z_v,gr_v,gg,vmin,step,gs,ls,ir,N,
+              ALPHA,RN,PN,IS,RP,RR,RESAMP):
+    pos=np.empty(N); rate=np.empty(N); w=np.ones(N)/N
+    for j in range(N):
+        pos[j]=ls+IS*np.random.randn()
+        rate[j]=ir+0.01*np.random.randn()
+    pts=np.empty(len(md_v)); std_=np.empty(len(md_v)); pm=md_v[0]-1.
+    for i in range(len(md_v)):
+        dm=md_v[i]-pm; dm=max(dm,1.)
+        for j in range(N):
+            rate[j]=ALPHA*rate[j]+RN*np.random.randn()
+            pos[j]+=rate[j]*dm+PN*np.random.randn()
+            tvt_j=pos[j]-z_v[i]
+            tvt_j=max(tvt_j,vmin-50.); tvt_j=min(tvt_j,vmin+len(gg)*step+50.)
+            pos[j]=tvt_j+z_v[i]
+        if not np.isnan(gr_v[i]):
+            ws=0.
+            for j in range(N):
+                eg=_interp1(gg,pos[j]-z_v[i],vmin,step)
+                d=(gr_v[i]-eg)/gs
+                lk=max(np.exp(-0.5*d*d) if d*d<600. else 0.,1e-300)
+                w[j]*=lk; ws+=w[j]
+            if ws>0.:
+                for j in range(N): w[j]/=ws
+            else:
+                for j in range(N): w[j]=1./N
+        ne=0.
+        for j in range(N): ne+=w[j]*w[j]
+        if 1./ne<RESAMP*N:
+            pos,rate=_resamp(pos,rate,w,N,RP,RR)
+            for j in range(N): w[j]=1./N
+        tv=0.
+        for j in range(N): tv+=w[j]*(pos[j]-z_v[i])
+        pts[i]=tv; va=0.
+        for j in range(N): va+=w[j]*(pos[j]-z_v[i]-tv)**2
+        std_[i]=va**0.5; pm=md_v[i]
+    return pts,std_
+
+@njit(cache=True)
+def _pf_z(md_v,z_v,gr_v,gr_sm_v,gg_p,gg_s,vmin,step,
+          gs,ip,iv,beta,icpt,zsig,N,
+          MOM,VN,PN,GR_WT,RP,RV,RESAMP):
+    pos=np.empty(N); vel=np.empty(N); w=np.ones(N)/N
+    for j in range(N):
+        pos[j]=ip+0.5*np.random.randn()
+        vel[j]=iv+0.02*np.random.randn()
+    pts=np.empty(len(md_v)); std_=np.empty(len(md_v)); pm=md_v[0]-1.; pz=z_v[0]-1.
+    for i in range(len(md_v)):
+        dm=md_v[i]-pm; dm=max(dm,1.)
+        dzd=(z_v[i]-pz)/dm; ve=beta*dzd+icpt
+        for j in range(N):
+            vel[j]=MOM*vel[j]+VN*np.random.randn()
+            pos[j]+=vel[j]*dm+PN*np.random.randn()
+            pos[j]=max(pos[j],vmin-50.); pos[j]=min(pos[j],vmin+len(gg_p)*step+50.)
+        if not np.isnan(gr_v[i]):
+            ws=0.
+            for j in range(N):
+                ep=_interp1(gg_p,pos[j],vmin,step)
+                dp=(gr_v[i]-ep)/gs
+                lp=max(np.exp(-0.5*dp*dp) if dp*dp<600. else 0.,1e-300)
+                if not np.isnan(gr_sm_v[i]):
+                    es=_interp1(gg_s,pos[j],vmin,step)
+                    ds=(gr_sm_v[i]-es)/(gs*1.5)
+                    ls=max(np.exp(-0.5*ds*ds) if ds*ds<600. else 0.,1e-300)
+                    lk=(1.-GR_WT)*lp+GR_WT*ls
+                else: lk=lp
+                lk=max(lk,1e-300); w[j]*=lk; ws+=w[j]
+            if ws>0.:
+                for j in range(N): w[j]/=ws
+            else:
+                for j in range(N): w[j]=1./N
+        ws2=0.
+        for j in range(N):
+            dv=(vel[j]-ve)/max(zsig*2.,0.005)
+            lz=max(np.exp(-0.5*dv*dv) if dv*dv<600. else 0.,1e-300)
+            w[j]*=lz; ws2+=w[j]
+        if ws2>0.:
+            for j in range(N): w[j]/=ws2
+        else:
+            for j in range(N): w[j]=1./N
+        ne=0.
+        for j in range(N): ne+=w[j]*w[j]
+        if 1./ne<RESAMP*N:
+            pos,vel=_resamp(pos,vel,w,N,RP,RV)
+            for j in range(N): w[j]=1./N
+        wm=0.
+        for j in range(N): wm+=w[j]*pos[j]
+        pts[i]=wm; va=0.
+        for j in range(N): va+=w[j]*(pos[j]-wm)**2
+        std_[i]=va**0.5; pm=md_v[i]; pz=z_v[i]
+    return pts,std_
+
+# Dense grid for O(1) typewell lookup
+def _grid(tw_tvt,tw_gr,step=0.2):
+    tmin=float(tw_tvt.min()); tmax=float(tw_tvt.max())
+    tvt_g=np.arange(tmin,tmax+step,step)
+    return np.interp(tvt_g,tw_tvt,tw_gr).astype(np.float64),float(tmin),float(step)
+
+def _gr_sig(hw,tw_tvt,tw_gr):
+    kn=hw[hw['TVT_input'].notna()&hw['GR'].notna()]
+    if len(kn)<20: return float(PF_GR_SIG_DEF)
+    return float(np.clip(np.std(kn['GR'].values-np.interp(kn['TVT_input'].values,tw_tvt,tw_gr)),
+                          PF_GR_SIG_MIN,PF_GR_SIG_MAX))
+
+def _nn(arr,v):
+    i=int(np.searchsorted(arr,v,'left'))
+    if i>=len(arr): return len(arr)-1
+    if i>0 and abs(arr[i-1]-v)<=abs(arr[i]-v): return i-1
+    return i
+
+def _smooth(vals,fb,r):
+    s=pd.Series(vals,dtype='float32').interpolate(limit_direction='both').fillna(fb)
+    return (s.rolling(r*2+1,center=True,min_periods=1).mean() if r>0 else s).to_numpy(np.float32)
+
+def beam_search(gr_h,tw_tvt,tw_gr,start_tvt,bs,mc,es,r):
+    si=_nn(tw_tvt,start_tvt)
+    sgr=_smooth(gr_h,float(np.nanmean(tw_gr)),r).astype(np.float64)
+    path=_beam_jit(sgr,tw_gr.astype(np.float64),si,bs,float(mc),float(es))
+    return tw_tvt[path].astype(np.float32)
+
+def run_pf_ancc(hw,tw_tvt,tw_gr,N=ANCC_N):
+    gs=_gr_sig(hw,tw_tvt,tw_gr)
+    kn=hw[hw['TVT_input'].notna()]; ev=hw[hw['TVT_input'].isna()]
+    if len(ev)==0: return np.array([]),np.array([])
+    ls=float(kn['TVT_input'].iloc[-1]+kn['Z'].iloc[-1])
+    tail=kn.tail(30); dt=np.diff(tail['TVT_input'].values)
+    dz=np.diff(tail['Z'].values); dm=np.diff(tail['MD'].values); m=dm>0
+    ir=float(np.median((dt+dz)[m]/dm[m])) if m.sum()>=3 else 0.
+    gg,gmin,gst=_grid(tw_tvt,tw_gr)
+    pts,std=_pf_ancc(ev['MD'].values.astype(np.float64),ev['Z'].values.astype(np.float64),
+                      ev['GR'].values.astype(np.float64),gg,gmin,gst,
+                      gs,ls,ir,N,ANCC_ALPHA,ANCC_RN,ANCC_PN,ANCC_IS,ANCC_RP,ANCC_RR,PF_RESAMP)
+    return pts.astype(np.float32),std.astype(np.float32)
+
+def run_pf_z(hw,tw_tvt,tw_gr,N=PF_N):
+    gs=_gr_sig(hw,tw_tvt,tw_gr)
+    tw_s=pd.Series(tw_gr).rolling(PF_GR_WIN,center=True,min_periods=1).mean().values.astype(np.float32)
+    kna=hw[hw['TVT_input'].notna()]; ev=hw[hw['TVT_input'].isna()]
+    if len(ev)==0: return np.array([]),np.array([])
+    dz_k=np.diff(kna['Z'].values); dvt=np.diff(kna['TVT_input'].values)
+    dmd_k=np.diff(kna['MD'].values); m2=dmd_k>0
+    if m2.sum()>=10:
+        vz=dz_k[m2]/dmd_k[m2]; vt=dvt[m2]/dmd_k[m2]
+        A=np.column_stack([vz,np.ones_like(vz)]); c,_,_,_=np.linalg.lstsq(A,vt,rcond=None)
+        beta,icpt,zsig=float(c[0]),float(c[1]),max(float(np.std(vt-(c[0]*vz+c[1]))),0.001)
+    else: beta,icpt,zsig=-1.,0.,0.1
+    t2=kna.tail(20); dvt2=np.diff(t2['TVT_input'].values); dmd2=np.diff(t2['MD'].values); m3=dmd2>0
+    iv=float(np.median(dvt2[m3]/dmd2[m3])) if m3.sum()>=3 else 0.
+    gg,gmin,gst=_grid(tw_tvt,tw_gr)
+    gs2,_,_=_grid(tw_tvt,tw_s)
+    gr_sm=hw['GR'].rolling(PF_GR_WIN,center=True,min_periods=1).mean()
+    pts,std=_pf_z(ev['MD'].values.astype(np.float64),ev['Z'].values.astype(np.float64),
+                   ev['GR'].values.astype(np.float64),
+                   gr_sm.loc[ev.index].values.astype(np.float64),
+                   gg,gs2,gmin,gst,gs,float(kna['TVT_input'].iloc[-1]),iv,
+                   beta,icpt,zsig,N,
+                   PF_MOM,PF_VN,PF_PN,PF_GR_WT,PF_ROUGH_P,PF_ROUGH_V,PF_RESAMP)
+    return pts.astype(np.float32),std.astype(np.float32)
+
+
+_md=np.linspace(1,50,20,np.float64); _z=np.zeros(20,np.float64); _gr=np.full(20,50.,np.float64)
+_gg=np.linspace(45,55,100,np.float64)
+_pf_ancc(_md,_z,_gr,_gg,45.,0.1,20.,50.,0.,8,0.998,0.002,0.005,0.3,0.1,0.001,0.5)
+_pf_z(_md,_z,_gr,_gr,_gg,_gg,45.,0.1,20.,50.,0.,-1.,0.,0.1,8,0.993,0.005,0.01,0.3,0.2,0.003,0.5)
+_beam_jit(np.random.randn(30),np.random.randn(50),25,8,15.,100.)
+
+def robust_slope(x,y,w=None):
+    x=np.asarray(x,float); y=np.asarray(y,float)
+    m=np.isfinite(x)&np.isfinite(y)
+    if m.sum()<2 or np.std(x[m])<1e-6: return 0.
+    return float(np.polyfit(x[m],y[m],1)[0])
+
+def affine_cal(kgr,tw_at_k,min_pts=20):
+    v=np.isfinite(kgr)&np.isfinite(tw_at_k)
+    if v.sum()<min_pts or np.std(tw_at_k[v])<1e-6:
+        return 1.,float(np.nanmean(kgr)-np.nanmean(tw_at_k)) if v.any() else 0.
+    a,b=np.polyfit(tw_at_k[v],kgr[v],1); return float(a),float(b)
+
+def seg_b_well(ktvt,kz,form_col):
+    """Segment b_well: early/mid/late thirds + full prefix.
+    Returns (b_full, b_early, b_mid, b_late, b_wls) for feature richness."""
+    bv=ktvt+kz-form_col; n=len(bv)
+    b_full=float(np.median(bv))
+    b_late=float(np.median(bv[max(0,n-50):])) if n>=5 else b_full
+    t1,t2=n//3, 2*n//3
+    b_early=float(np.median(bv[:max(1,t1)])) if t1>0 else b_full
+    b_mid  =float(np.median(bv[t1:max(t1+1,t2)])) if t2>t1 else b_full
+    # WLS (tail-upweighted)
+    w=np.exp(0.02*np.arange(n)); w/=w.sum()
+    b_wls=float(np.dot(w,bv))
+    return b_full,b_early,b_mid,b_late,b_wls
+
+def multi_scale_ncc(kgr,ktvt,hgr,hws=(8,15,25),stride=3):
+    """Multi-scale NCC. Returns score-weighted ensemble + per-scale signals."""
+    out=[]
+    for hw in hws:
+        win=2*hw+1; nk=len(kgr); nh=len(hgr)
+        if nk<win+1 or nh==0:
+            out.append((np.full(nh,ktvt[-1],np.float32),np.zeros(nh,np.float32))); continue
+        kg=pd.Series(kgr).rolling(5,center=True,min_periods=1).mean().values.astype(np.float32)
+        hg=pd.Series(hgr).rolling(5,center=True,min_periods=1).mean().values.astype(np.float32)
+        sts=np.arange(0,nk-win+1,stride,dtype=np.int32); M=len(sts)
+        if M==0:
+            out.append((np.full(nh,ktvt[-1],np.float32),np.zeros(nh,np.float32))); continue
+        C=kg[sts[:,None]+np.arange(win,dtype=np.int32)[None,:]].astype(np.float32)
+        Cn=(C-C.mean(1,keepdims=True))/(C.std(1,keepdims=True)+1e-6)
+        hp=np.pad(hg,hw,mode='edge')
+        H=hp[np.arange(nh)[:,None]+np.arange(win)[None,:]].astype(np.float32)
+        Hn=(H-H.mean(1,keepdims=True))/(H.std(1,keepdims=True)+1e-6)
+        ncc=Hn@Cn.T/win; best=ncc.argmax(1); score=ncc.max(1).astype(np.float32)
+        out.append((ktvt[np.clip(sts[best]+hw,0,nk-1)].astype(np.float32),score))
+    # Score-weighted ensemble (NEW: softmax-weighted combination)
+    tvts=np.stack([o[0] for o in out],1); scores=np.stack([o[1] for o in out],1)
+    sw=np.exp(3.*scores); sw/=sw.sum(1,keepdims=True)+1e-9
+    sc_ens=(tvts*sw).sum(1).astype(np.float32)
+    return out, sc_ens   # [(tvt8,sc8),(tvt15,sc15),(tvt25,sc25)], ensemble
+
+class FormationPlaneKNN:
+    def __init__(self,well_ids,data_dir):
+        rows=[]
+        for wid in well_ids:
+            p=data_dir/f'{wid}__horizontal_well.csv'
+            try: df=pd.read_csv(p,usecols=['X','Y']+FORMATIONS).dropna()
+            except: continue
+            if len(df)==0: continue
+            row={'wid':wid,'x':float(df['X'].median()),'y':float(df['Y'].median())}
+            for c in FORMATIONS: row[f'{c}_m']=float(df[c].median())
+            rows.append(row)
+        self.df=pd.DataFrame(rows); self.wmap={w:i for i,w in enumerate(self.df['wid'])}
+        xy=self.df[['x','y']].to_numpy(); self.scale=np.where(xy.std(0)<1e-3,1.,xy.std(0))
+        self.tree=cKDTree(xy/self.scale)
+        self.xa=self.df['x'].to_numpy(); self.ya=self.df['y'].to_numpy()
+        self.fa=self.df[[f'{c}_m' for c in FORMATIONS]].to_numpy(np.float64)
+
+    def impute(self,xy_q,self_wid=None,k=PLANE_K):
+        q=xy_q/self.scale; nf=min(k+5,len(self.df))
+        dist,idx=self.tree.query(q,k=nf,workers=-1)
+        if self_wid in self.wmap: dist=np.where(idx==self.wmap[self_wid],np.inf,dist)
+        ord=np.argpartition(dist,min(k-1,nf-1),1)[:,:k]
+        dk=np.take_along_axis(dist,ord,1); ik=np.take_along_axis(idx,ord,1)
+        vk=np.isfinite(dk); w=np.where(vk,1./(dk+1e-3),0.).astype(np.float64)
+        xn=self.xa[ik]; yn=self.ya[ik]; fn=self.fa[ik]; wx=w*xn; wy=w*yn
+        A=np.zeros((len(q),3,3))
+        A[:,0,0]=(wx*xn).sum(1); A[:,0,1]=(wx*yn).sum(1); A[:,0,2]=wx.sum(1)
+        A[:,1,0]=A[:,0,1]; A[:,1,1]=(wy*yn).sum(1); A[:,1,2]=wy.sum(1)
+        A[:,2,0]=A[:,0,2]; A[:,2,1]=A[:,1,2]; A[:,2,2]=w.sum(1)
+        A[:,0,0]+=1e-9; A[:,1,1]+=1e-9; A[:,2,2]+=1e-9
+        rhs=np.stack([(wx[:,:,None]*fn).sum(1),(wy[:,:,None]*fn).sum(1),(w[:,:,None]*fn).sum(1)],1)
+        try: coef=np.linalg.solve(A,rhs)
+        except:
+            coef=np.zeros((len(q),3,6))
+            for r in range(len(q)):
+                try: coef[r]=np.linalg.pinv(A[r])@rhs[r]
+                except: pass
+        Xq=xy_q[:,0]; Yq=xy_q[:,1]
+        pred=(Xq[:,None]*coef[:,0,:]+Yq[:,None]*coef[:,1,:]+coef[:,2,:]).astype(np.float32)
+        pred[~vk.any(1)]=self.fa.mean(0)
+        return pred,np.where(vk,dk,np.inf).min(1).astype(np.float32)
+
+class DenseANCCImputer:
+    def __init__(self,well_ids,data_dir,spw=DENSE_SPW):
+        xs,ys,anccs,wids=[],[],[],[]
+        for wid in well_ids:
+            p=data_dir/f'{wid}__horizontal_well.csv'
+            try: df=pd.read_csv(p,usecols=['X','Y','ANCC']).dropna()
+            except: continue
+            if len(df)==0: continue
+            ix=np.linspace(0,len(df)-1,min(spw,len(df)),dtype=int); s=df.iloc[ix]
+            xs.append(s['X'].values); ys.append(s['Y'].values)
+            anccs.append(s['ANCC'].values); wids.extend([wid]*len(s))
+        self.xy=np.column_stack([np.concatenate(xs),np.concatenate(ys)])
+        self.ancc=np.concatenate(anccs).astype(np.float32); self.wids=np.array(wids)
+        self.scale=np.where(self.xy.std(0)<1e-3,1.,self.xy.std(0))
+        self.tree=cKDTree(self.xy/self.scale)
+
+    def impute(self,xy_q,self_wid=None,k=DENSE_K,nfetch=5000):
+        xy_q=np.atleast_2d(xy_q); q=xy_q/self.scale; nf=min(nfetch,len(self.ancc))
+        dist,idx=self.tree.query(q,k=nf,workers=-1)
+        if self_wid: dist=np.where(self.wids[idx]==self_wid,np.inf,dist)
+        ord=np.argpartition(dist,min(k-1,nf-1),1)[:,:k]
+        dk=np.take_along_axis(dist,ord,1); ik=np.take_along_axis(idx,ord,1)
+        vk=np.isfinite(dk); w=np.where(vk,1./(dk+1e-3),0.)
+        sw=w.sum(1); safe=np.where(sw<1e-9,1.,sw); an=self.ancc[ik]
+        ap=(an*w).sum(1)/safe; ap=np.where(sw<1e-9,float(self.ancc.mean()),ap)
+        var=((an-ap[:,None])**2*w).sum(1)/safe
+        return ap.astype(np.float32),np.sqrt(np.maximum(var,0.)).astype(np.float32),np.where(vk,dk,np.inf).min(1).astype(np.float32)
+
+hw_paths=sorted((CFG.dataset_path / "train").glob('*__horizontal_well.csv'))
+train_wids=[p.stem.replace('__horizontal_well','') for p in hw_paths]
+FI=FormationPlaneKNN(train_wids,CFG.dataset_path / "train")
+DI=DenseANCCImputer(train_wids,CFG.dataset_path / "train")
+
+_FI=FI; _DI=DI
+ANCH_OFFS=np.array([-80,-40,-20,-10,-5,0,5,10,20,40,80],np.float32)
+BEAM_OFFS=np.array([-40,-20,-10,-5,-3,0,3,5,10,20,40],np.float32)
+SC_OFFS  =np.array([-30,-15,-8,-4,-2,0,2,4,8,15,30],np.float32)
+PF_OFFS  =np.array([-30,-15,-8,-4,-2,0,2,4,8,15,30],np.float32)
+
+def build_well(hw_path,tw_path,is_train):
+    global _FI,_DI
+    wid=Path(hw_path).stem.replace('__horizontal_well','')
+    try:
+        hw=pd.read_csv(hw_path); tw=pd.read_csv(tw_path).sort_values('TVT')
+    except: return None
+    if is_train and 'TVT' not in hw.columns: return None
+    kn=hw[hw['TVT_input'].notna()]; ev=hw[hw['TVT_input'].isna()]
+    if len(ev)==0 or len(kn)<10: return None
+    if is_train and hw['TVT'].isna().all(): return None
+    tw_tvt=tw['TVT'].to_numpy(np.float32); tw_gr=tw['GR'].to_numpy(np.float32)
+    if len(tw_tvt)<3: return None
+
+    pf_a,std_a=run_pf_ancc(hw,tw_tvt,tw_gr)
+    if len(pf_a)==0: return None
+    pf_z,std_z=run_pf_z(hw,tw_tvt,tw_gr)
+    pf_use=pf_a.astype(np.float32); std_use=std_a.astype(np.float32)
+    has_z=len(pf_z)==len(pf_a) and not np.any(np.isnan(pf_z))
+
+    lk=kn.iloc[-1]; last_tvt=float(lk['TVT_input'])
+    gr_full=hw['GR'].astype(float).interpolate(limit_direction='both').fillna(float(np.nanmean(tw_gr)))
+    hgr=gr_full.iloc[ev.index[0]:].to_numpy(np.float32)
+    kgr=gr_full.iloc[:len(kn)].to_numpy(np.float32)
+
+    # 7 beams (Numba JIT   2)
+    bpaths={}
+    for (bs,mc,es,r,tag) in BEAMS:
+        bpaths[tag]=beam_search(hgr,tw_tvt,tw_gr,last_tvt,bs,mc,es,r)
+    beam_ref=(bpaths['cons']+bpaths['sm5'])/2.
+
+    # Multi-scale NCC     score-weighted ensemble
+    ktvt=kn['TVT_input'].to_numpy(np.float32)
+    sc_res,sc_ens=multi_scale_ncc(kgr,ktvt,hgr,hws=(8,15,25),stride=3)
+    sc8,sc8s=sc_res[0]; sc15,sc15s=sc_res[1]; sc25,sc25s=sc_res[2]
+    sc_cons=(sc8+sc15+sc25)/3.
+    sc_trust=float(np.clip(len(kn)/200.,0.,0.6))
+    hyb_ref=(1-sc_trust)*beam_ref+sc_trust*sc_ens  # use ensemble not single
+
+    tw_at_k=np.interp(ktvt,tw_tvt,tw_gr).astype(np.float32)
+    a_cal,b_cal=affine_cal(kgr,tw_at_k)
+    kmd=kn['MD'].to_numpy(np.float32); kz=kn['Z'].to_numpy(np.float32)
+    pfx_rmse=float(np.sqrt(np.mean((kgr-tw_at_k)**2)))
+    slp_all=robust_slope(kmd,ktvt); slp_50=robust_slope(kmd[-50:],ktvt[-50:])
+    slp_z=robust_slope(kz,ktvt)
+
+    swid=wid if is_train else None
+    xy_ev=ev[['X','Y']].to_numpy(np.float64); xy_kn=kn[['X','Y']].to_numpy(np.float64)
+    form_ev,knn_d=_FI.impute(xy_ev,self_wid=swid)
+    form_kn,_   =_FI.impute(xy_kn,self_wid=swid)
+    z_kn=kn['Z'].to_numpy(np.float32); z_ev=ev['Z'].to_numpy(np.float32)
+
+    # Per-formation: segment b_well (early/mid/late/wls) + TVT + known-zone RMSE
+    tvt_fs={}; form_rmse={}; form_list=[]
+    for fi2,fn in enumerate(FORMATIONS):
+        b_full,b_early,b_mid,b_late,b_wls=seg_b_well(ktvt,z_kn,form_kn[:,fi2])
+        tvt_f  =(-z_ev+form_ev[:,fi2]+b_full ).astype(np.float32)
+        tvt_fw =(-z_ev+form_ev[:,fi2]+b_wls  ).astype(np.float32)
+        tvt_f50=(-z_ev+form_ev[:,fi2]+b_late ).astype(np.float32)
+        tvt_fs[f'tvtF_{fn}']=tvt_f; tvt_fs[f'tvtFw_{fn}']=tvt_fw
+        tvt_fs[f'tvtF50_{fn}']=tvt_f50
+        tvt_fs[f'bw_{fn}']=np.float32(b_full); tvt_fs[f'bww_{fn}']=np.float32(b_wls)
+        tvt_fs[f'bw50_{fn}']=np.float32(b_late)
+        tvt_fs[f'bw_early_{fn}']=np.float32(b_early)   # NEW: early segment
+        tvt_fs[f'bw_mid_{fn}']=np.float32(b_mid)       # NEW: mid segment
+        form_rmse[fn]=float(np.sqrt(np.mean((ktvt-(-z_kn+form_kn[:,fi2]+b_full))**2)))
+        form_list.append(tvt_f)
+
+    fs=np.stack(form_list,1)
+    form_mean_d=(fs.mean(1)-last_tvt).astype(np.float32)
+    form_std_d =fs.std(1).astype(np.float32)
+    form_rng_d =(fs.max(1)-fs.min(1)).astype(np.float32)
+
+    d_ancc,d_std,d_dist=_DI.impute(xy_ev,self_wid=swid)
+    d_kn,d_std_kn,_=_DI.impute(xy_kn,self_wid=swid)
+    b_vd=ktvt+z_kn-d_kn
+    _,b_de,b_dm,b_dl,b_dw=seg_b_well(ktvt,z_kn,d_kn)
+    b_d=float(np.median(b_vd))
+    tvt_dense  =(-z_ev+d_ancc+b_d  ).astype(np.float32)
+    tvt_densew =(-z_ev+d_ancc+b_dw ).astype(np.float32)
+    tvt_dense50=(-z_ev+d_ancc+b_dl ).astype(np.float32)
+    res_kn=ktvt+z_kn-d_kn
+    d_rmse=float(np.sqrt(np.mean(res_kn**2))); d_bias=float(np.mean(res_kn)); d_nb_std=float(np.mean(d_std_kn))
+
+    all_sigs=[pf_use]+[p for p in bpaths.values()]+[sc8,sc15,sc25,sc_ens,tvt_fs['tvtF_ANCC'],tvt_dense]
+    sig_mat=np.stack(all_sigs,1)
+    sig_std=sig_mat.std(1).astype(np.float32)
+    sig_mean=(sig_mat.mean(1)-last_tvt).astype(np.float32)
+
+    gr_s=pd.Series(gr_full.values); rolls={}
+    for w in [5,21,51,101]:
+        r=gr_s.rolling(w,center=True,min_periods=1)
+        rolls[f'grm{w}']=r.mean().iloc[ev.index].values.astype(np.float32)
+        rolls[f'grs{w}']=r.std().fillna(0).iloc[ev.index].values.astype(np.float32)
+    for lag in [1,5,15,30]:
+        rolls[f'glag{lag}']=gr_s.shift(lag).bfill().iloc[ev.index].values.astype(np.float32)
+        rolls[f'glead{lag}']=gr_s.shift(-lag).ffill().iloc[ev.index].values.astype(np.float32)
+    gr_d1=gr_s.diff().fillna(0.).iloc[ev.index].values.astype(np.float32)
+    gr_d2=gr_s.diff().diff().fillna(0.).iloc[ev.index].values.astype(np.float32)
+    gr_env=gr_s.rolling(21,center=True,min_periods=1).max().iloc[ev.index].values.astype(np.float32)
+    gr_nrg=np.sqrt(np.maximum((gr_s**2).rolling(21,center=True,min_periods=1).mean(),0.)
+                   ).iloc[ev.index].values.astype(np.float32)
+
+    hmd=ev['MD'].to_numpy(np.float32); md_since=hmd-float(lk['MD'])
+    slp_b_all=(last_tvt+slp_all*md_since).astype(np.float32)
+    slp_b_50 =(last_tvt+slp_50 *md_since).astype(np.float32)
+
+    mdd=hw['MD'].diff().replace(0,np.nan)
+    dzdmd=(hw['Z'].diff()/mdd).iloc[ev.index].values.astype(np.float32)
+    dxdmd=(hw['X'].diff()/mdd).iloc[ev.index].values.astype(np.float32)
+    dydmd=(hw['Y'].diff()/mdd).iloc[ev.index].values.astype(np.float32)
+
+    nh=len(ev); frac=(np.arange(nh)/max(nh-1,1)).astype(np.float32)
+    def sc(v): return np.full(nh,np.float32(v),np.float32)
+
+    feats={
+        'well':wid,'id':[f'{wid}_{i}' for i in ev.index],
+        'last_known_tvt':sc(last_tvt),
+        'pf_ancc':pf_use,'pf_ancc_std':std_use,
+        'pf_ancc_delta':(pf_use-last_tvt).astype(np.float32),
+        'pf_z':(pf_z.astype(np.float32) if has_z else sc(last_tvt)),
+        'pf_z_delta':((pf_z-last_tvt).astype(np.float32) if has_z else sc(0.)),
+        'pf_vs_z':((pf_use-pf_z.astype(np.float32)) if has_z else sc(0.)),
+        **{f'beam_{t}_d':(p-np.float32(last_tvt)).astype(np.float32) for t,p in bpaths.items()},
+        'beam_mean_d':np.stack([(p-last_tvt) for p in bpaths.values()],1).mean(1).astype(np.float32),
+        'beam_std_d': np.stack([(p-last_tvt) for p in bpaths.values()],1).std(1).astype(np.float32),
+        'beam_med_d': np.median(np.stack([(p-last_tvt) for p in bpaths.values()],1),1).astype(np.float32),
+        'sc8_d':(sc8-np.float32(last_tvt)).astype(np.float32),'sc8_sc':sc8s,
+        'sc15_d':(sc15-np.float32(last_tvt)).astype(np.float32),'sc15_sc':sc15s,
+        'sc25_d':(sc25-np.float32(last_tvt)).astype(np.float32),'sc25_sc':sc25s,
+        'sc_cons_d':(sc_cons-np.float32(last_tvt)).astype(np.float32),
+        'sc_ens_d':(sc_ens-np.float32(last_tvt)).astype(np.float32),  # score-weighted ensemble
+        'sc_trust':sc(sc_trust),'hyb_d':(hyb_ref-np.float32(last_tvt)).astype(np.float32),
+        'sig_std':sig_std,'sig_mean_d':sig_mean,
+        **tvt_fs,
+        **{f'frm_rmse_{fn}':sc(form_rmse[fn]) for fn in FORMATIONS},
+        'form_mean_d':form_mean_d,'form_std_d':form_std_d,'form_rng_d':form_rng_d,
+        'spatial_ancc_d':(form_ev[:,0]-np.float32(np.interp(last_tvt,tw_tvt,tw_gr))),
+        'spatial_knn_dist':knn_d,
+        'dense_ancc':d_ancc,'dense_std':d_std,'dense_dist':d_dist,
+        'tvt_dense_d' :(tvt_dense -last_tvt).astype(np.float32),
+        'tvt_densew_d':(tvt_densew-last_tvt).astype(np.float32),
+        'tvt_dense50_d':(tvt_dense50-last_tvt).astype(np.float32),
+        'dense_rmse':sc(d_rmse),'dense_bias':sc(d_bias),'dense_nb_std':sc(d_nb_std),
+        'pf_vs_spatial':(pf_use-tvt_fs['tvtF_ANCC']).astype(np.float32),
+        'pf_vs_dense':(pf_use-tvt_dense).astype(np.float32),
+        'spatial_vs_dense':(tvt_fs['tvtF_ANCC']-tvt_dense).astype(np.float32),
+        'beam_vs_spatial':(bpaths['cons']-tvt_fs['tvtF_ANCC']).astype(np.float32),
+        'sc_vs_beam':(sc_ens-bpaths['cons']).astype(np.float32),
+        'cal_a':sc(a_cal),'cal_b':sc(b_cal),
+        'pfx_rmse':sc(pfx_rmse),'known_len':sc(len(kn)),'eval_len':sc(nh),
+        'slp_all':sc(slp_all),'slp_50':sc(slp_50),'slp_z':sc(slp_z),
+        'slp_b_d_all':(slp_b_all-last_tvt).astype(np.float32),
+        'slp_b_d_50': (slp_b_50 -last_tvt).astype(np.float32),
+        'ktvt_range':sc(float(np.ptp(ktvt))),'ktvt_std':sc(float(ktvt.std())),
+        'md_since':md_since,'frac':frac,'frac2':frac**2,'sqrt_frac':np.sqrt(frac),
+        'z':z_ev,
+        'dx':(ev['X']-float(lk['X'])).to_numpy(np.float32),
+        'dy':(ev['Y']-float(lk['Y'])).to_numpy(np.float32),
+        'dz':(z_ev-float(lk['Z'])).astype(np.float32),
+        'dxy':np.sqrt((ev['X']-float(lk['X']))**2+(ev['Y']-float(lk['Y']))**2).to_numpy(np.float32),
+        'dzdmd':dzdmd,'dxdmd':dxdmd,'dydmd':dydmd,
+        'gr':hgr,'gr_d1':gr_d1,'gr_d2':gr_d2,'gr_env':gr_env,'gr_nrg':gr_nrg,
+        'gr_vs_tw_anc':hgr-np.float32(np.interp(last_tvt,tw_tvt,tw_gr)),
+        'gr_vs_slp_all':hgr-np.interp(slp_b_all,tw_tvt,tw_gr).astype(np.float32),
+        **{f'tda{int(o)}' :hgr-np.float32(np.interp(last_tvt+o,tw_tvt,tw_gr)) for o in ANCH_OFFS},
+        **{f'tdbc{int(o)}':hgr-np.interp(beam_ref+o,tw_tvt,tw_gr).astype(np.float32) for o in BEAM_OFFS},
+        **{f'tdsc{int(o)}':hgr-np.interp(sc_ens+o,tw_tvt,tw_gr).astype(np.float32) for o in SC_OFFS},
+        **{f'tdpf{int(o)}':hgr-np.interp(pf_use+o,tw_tvt,tw_gr).astype(np.float32) for o in PF_OFFS},
+        'tw_range':sc(float(np.ptp(tw_tvt))),'tw_gr_mean':sc(float(tw_gr.mean())),
+    }
+    for k,v in rolls.items(): feats[k]=v
+    result=pd.DataFrame(feats)
+    if is_train:
+        if 'TVT' not in ev.columns or ev['TVT'].isna().all(): return None
+        result['target']=(ev['TVT'].to_numpy(np.float32)-np.float32(last_tvt))
+    return result
+
+def build_dataset(paths,is_train,label):
+    args=[(str(p),str(p.parent/f'{p.stem.replace("__horizontal_well","")}__typewell.csv'),is_train)
+          for p in paths
+          if (p.parent/f'{p.stem.replace("__horizontal_well","")}__typewell.csv').exists()]
+    t0=time.time()
+    res=Parallel(n_jobs=NCPU,prefer='threads',verbose=3)(
+        delayed(build_well)(hp,tp,it) for hp,tp,it in args)
+    parts=[r for r in res if r is not None]
+    return pd.concat(parts,ignore_index=True) if parts else pd.DataFrame()
+
+# %% cell 9
+if (CFG.artifacts_path / "data" / "train.csv").exists():
+    train_df = pd.read_csv(CFG.artifacts_path / "data" / "train.csv", low_memory=False)
+else:
+    train_paths = sorted((CFG.dataset_path / "train").glob('*__horizontal_well.csv'))
+    train_df = build_dataset(train_paths, is_train=True, label="train")    
+
+test_paths = sorted((CFG.dataset_path / "test").glob('*__horizontal_well.csv'))
+test_df = build_dataset(test_paths, is_train=False, label="test")
+
+features = [c for c in train_df.columns if c not in {'well','id','target'}]
+
+X = train_df[features]
+y = train_df['target']
+g = train_df['well']
+
+X_test = test_df[features]
+
+# %% markdown 10: # 3. Training
+
+
+# %% cell 11
+lgb_params = [
+    dict(
+        boosting_type="gbdt", 
+        num_leaves=255, 
+        min_child_samples=15,
+        subsample=0.8, 
+        subsample_freq=1, 
+        colsample_bytree=0.8,
+        reg_lambda=3.0, 
+        reg_alpha=0.05, 
+        objective="regression",
+        verbose=-1, 
+        n_jobs=-1, 
+        device_type="gpu", 
+        gpu_use_dp=False, 
+        max_bin=255,
+        learning_rate=0.030, 
+        n_estimators=5000, 
+        seed=123
+    ),
+    dict(
+        n_jobs=-1, 
+        verbose=-1, 
+        reg_alpha=10.788188919840913, 
+        subsample=0.47437582748953966, 
+        num_leaves=64, 
+        reg_lambda=95.75401894533888, 
+        n_estimators=10000,
+        random_state=0,
+        boosting_type='gbdt', 
+        learning_rate=0.00934485794382918,
+        colsample_bytree=0.39283351290380497,
+        min_child_weight=0.24081152127177283, 
+        min_child_samples=40,
+        device='gpu',
+    ),
+    dict(
+        n_jobs=-1, 
+        verbose=-1, 
+        reg_alpha=10.788188919840913, 
+        subsample=0.47437582748953966, 
+        num_leaves=64, 
+        reg_lambda=95.75401894533888, 
+        n_estimators=10000,
+        random_state=29,
+        boosting_type='gbdt', 
+        learning_rate=0.00934485794382918,
+        colsample_bytree=0.39283351290380497,
+        min_child_weight=0.24081152127177283, 
+        min_child_samples=40,
+        device='gpu',
+    ),
+]
+
+cb_params = [
+    dict(
+        iterations=8000, 
+        depth=7, 
+        l2_leaf_reg=2.0,
+        min_data_in_leaf=15, 
+        border_count=254,
+        loss_function="RMSE", 
+        task_type="GPU", 
+        devices="0",
+        od_type="Iter", 
+        od_wait=300, 
+        verbose=0,
+        learning_rate=0.020, 
+        random_seed=7
+    ),
+    dict(
+        iterations=8000, 
+        depth=7, 
+        l2_leaf_reg=2.0,
+        min_data_in_leaf=15, 
+        border_count=254,
+        loss_function="RMSE", 
+        task_type="GPU", 
+        devices="0",
+        od_type="Iter", 
+        od_wait=300, 
+        verbose=0,
+        learning_rate=0.030, 
+        random_seed=123
+    ),
+]
+
+ridge_params = {
+    "random_state": 42,
+    "alpha": 1.6602834637650032,
+    "tol": 0.0005030247295617308,
+    "positive": True,
+    "fit_intercept": True
+}
+
+pp_params = {
+    'alpha': 1.0,
+    'tau': 85,
+    'w_pf': 0.09
+}
+
+# %% cell 12
+oof_preds = {}
+test_preds = {}
+
+overall_scores = {}
+fold_scores = {}
+
+# %% markdown 13: ## 3.1 LightGBM
+
+
+# %% cell 14
+for i, params in enumerate(lgb_params):   
+    save_path = f"models/lightgbm-{i+1}"
+    
+    if (CFG.artifacts_path / save_path).exists():
+        print(f"Loading lightgbm-{i+1} from disk...")
+        
+        trainer_paths = (CFG.artifacts_path / save_path).glob('*.pkl')
+        trainer = joblib.load(list(trainer_paths)[0])
+        
+        print(f"Loaded lightgbm-{i+1} with overall RMSE: {trainer.overall_score:.4f}\n")
+    else:
+     
+        trainer = Trainer(
+            estimator=LGBMRegressor(**params),
+            task="regression",
+            metric=CFG.metric,
+            cv=CFG.cv,
+            cv_args={"groups": g},
+            use_early_stopping=True,
+            verbose=True,
+            save=True,
+            save_path=save_path
+        )
+        
+        trainer.fit(
+            X, 
+            y,
+            fit_args={
+                "eval_metric": "rmse",
+                "callbacks": [
+                    log_evaluation(period=250), 
+                    early_stopping(stopping_rounds=250)
+                ]
+            }
+        )
+        print("\n\n")
+
+    oof_preds[f"lightgbm-{i+1}"] = trainer.oof_preds
+    test_preds[f"lightgbm-{i+1}"] = trainer.predict(X_test)
+    overall_scores[f"lightgbm-{i+1}"] = trainer.overall_score
+    fold_scores[f"lightgbm-{i+1}"] = trainer.fold_scores
+
+# %% markdown 15: ## 3.2 CatBoost
+
+
+# %% cell 16
+for i, params in enumerate(cb_params):    
+    save_path = f"models/catboost-{i+1}"
+    if (CFG.artifacts_path / save_path).exists():
+        print(f"Loading catboost-{i+1} from disk...")
+        
+        trainer_paths = (CFG.artifacts_path / save_path).glob('*.pkl')
+        trainer = joblib.load(list(trainer_paths)[0])
+        
+        print(f"Loaded catboost-{i+1} with overall RMSE: {trainer.overall_score:.4f}\n")
+    else:
+        trainer = Trainer(
+            estimator=CatBoostRegressor(**params),
+            task="regression",
+            metric=CFG.metric,
+            cv=CFG.cv,
+            cv_args={"groups": g},
+            use_early_stopping=True,
+            verbose=True,
+            save=True,
+            save_path=save_path
+        )
+        
+        trainer.fit(
+            X, 
+            y,
+            fit_args={
+                "verbose": 250,
+                "early_stopping_rounds": 250,
+                "use_best_model": True
+            }
+        )
+        print("\n\n")
+
+    oof_preds[f"catboost-{i+1}"] = trainer.oof_preds
+    test_preds[f"catboost-{i+1}"] = trainer.predict(X_test)
+    overall_scores[f"catboost-{i+1}"] = trainer.overall_score
+    fold_scores[f"catboost-{i+1}"] = trainer.fold_scores
+
+# %% markdown 17: # 4. Ensembling with Ridge
+
+
+# %% cell 18
+oof_preds = pd.DataFrame(oof_preds)
+test_preds = pd.DataFrame(test_preds)
+
+# %% cell 19
+ridge_trainer = Trainer(
+    Ridge(**ridge_params),
+    task="regression",
+    metric=CFG.metric,
+    cv=CFG.cv,
+    cv_args={"groups": g},
+    verbose=True
+)
+
+ridge_trainer.fit(oof_preds, y)
+
+ridge_oof_preds = ridge_trainer.oof_preds
+ridge_test_preds = ridge_trainer.predict(test_preds)
+
+overall_scores["ridge"] = ridge_trainer.overall_score
+fold_scores["ridge"] = ridge_trainer.fold_scores
+
+# %% markdown 20: # 5. Postprocessing
+
+
+# %% cell 21
+def apply_pp(df, md, pd_, alpha, tau, w_pf):
+    d = md * (1-w_pf) + pd_ * w_pf
+    if tau: 
+        d *= (1.-np.exp(-np.maximum(df['md_since'].values,0.) / tau))
+        
+    return d * alpha
+
+def sg_smooth(df, col, sg_w=17, sg_p=3):
+    df = df.copy()
+    
+    for _, g in df.groupby('well', sort=False):
+        v = g[col].values
+        n = len(v)
+        wl = min(sg_w, n)
+        
+        if wl % 2 == 0: 
+            wl -= 1
+            
+        if wl >= sg_p + 2: 
+            v = savgol_filter(v, wl, sg_p)
+            
+        df.loc[g.index,col] = v
+        
+    return df
+
+# %% cell 22
+base = train_df['last_known_tvt'].values
+ytrue = y.values + base
+
+pf_oof = (train_df['pf_ancc'].values - base)
+
+d = apply_pp(train_df, ridge_oof_preds, pf_oof, **pp_params)
+ridge_score = root_mean_squared_error(ytrue, base + d)
+
+overall_scores["ridge (pp)"] = ridge_score
+fold_scores["ridge (pp)"] = [ridge_score] * CFG.n_splits
+
+# %% markdown 23: # 6. Inference
+
+
+# %% markdown 24: ## 6.1 Ridge
+
+
+# %% cell 25
+test_df2 = test_df.copy()
+pf_test = test_df2['pf_ancc'].values - test_df2['last_known_tvt'].values
+
+test_df2['pred'] = test_df2['last_known_tvt'].values + apply_pp(
+    test_df2, 
+    ridge_test_preds,
+    pf_test, 
+    **pp_params
+)
+test_df2 = sg_smooth(test_df2, 'pred')
+
+# %% cell 26
+sample_sub = pd.read_csv(CFG.dataset_path / "sample_submission.csv")
+sub_1 = (sample_sub[['id']].merge(
+    test_df2[['id', 'pred']].rename(columns={'pred':'tvt'}),
+    on='id', 
+    how='left'
+))
+
+sub_1['tvt']=sub_1['tvt'].fillna(float(train_df['last_known_tvt'].mean()+train_df['target'].mean()))
+sub_1
+
+# %% markdown 27: ## 6.2 Heuristic model
+
+
+# %% cell 28
+sample = pd.read_csv(CFG.dataset_path / 'sample_submission.csv')
+sample['well']    = sample['id'].str[:8]
+sample['row_idx'] = sample['id'].str[9:].astype(int)
+
+train_hw_files = sorted(glob.glob(str(CFG.dataset_path / 'train' / '*__horizontal_well.csv')))
+train_wells = [os.path.basename(f).split('__')[0] for f in train_hw_files]
+
+test_hw_files = sorted(glob.glob(str(CFG.dataset_path / 'test' / '*__horizontal_well.csv')))
+test_wells = [os.path.basename(f).split('__')[0] for f in test_hw_files]
+
+rows = []
+for i, wid in enumerate(test_wells):
+    print(f'\nProcessing {i + 1}/{len(test_wells)}: {wid}...')
+    hw_te, tw_te = load_well(wid, 'test')
+
+    tvt_phys = None
+    hw_tr    = None
+    tw_tr    = None
+
+    # Physical model for visible wells
+    if wid in train_wells:
+        try:
+            hw_tr, tw_tr = load_well(wid, 'train')
+            hw_te['TVT_input'] = hw_tr['TVT_input'].values
+            tvt_phys = tvt_from_contacts(hw_tr, tw_tr)
+            print(f'  Physical model OK')
+        except Exception as e:
+            print(f'  Physical model failed: {e}')
+            tvt_phys = None
+
+    selector_code, selector_variant, selector_n_eval, selector_z_span = selector_well_code(hw_te)
+
+    # 128-seed likelihood-weighted PF ensemble
+    try:
+        tw_ref = tw_tr if tw_tr is not None else tw_te
+        pf_by_scale = run_pf_lik_ensemble_scales(hw_te, tw_ref, n_particles=500, n_seeds=128)
+        tvt_pf = pf_by_scale['pf_scale_8']
+        print(f'  PF 128-seed lik-ensemble OK scales={SELECTOR_SCALES}')
+    except Exception as e:
+        print(f'  PF failed: {e}')
+        last_known = hw_te['TVT_input'].dropna()
+        last_val   = float(last_known.iloc[-1]) if len(last_known) > 0 else 0.0
+        tvt_pf = hw_te['TVT_input'].fillna(last_val).values.astype(float)
+        pf_by_scale = {f'pf_scale_{scale:g}': tvt_pf.copy() for scale in SELECTOR_SCALES}
+
+    # Beam search ensemble
+    try:
+        tw_ref = tw_tr if tw_tr is not None else tw_te
+        tvt_beam = run_beam_ensemble(hw_te, tw_ref)
+        print(f'  Beam 14-config ensemble OK')
+    except Exception as e:
+        print(f'  Beam failed: {e}')
+        tvt_beam = tvt_pf.copy()
+
+    # Selector blending
+    last_known = hw_te['TVT_input'].dropna()
+    last_known_tvt = float(last_known.iloc[-1]) if len(last_known) > 0 else float(np.nanmean(tvt_pf))
+    tvt_selector = apply_selector_variant(selector_variant, pf_by_scale, tvt_beam, last_known_tvt)
+    print(
+        f'  Selector code={selector_code} variant={selector_variant} '
+        f'n_eval={selector_n_eval:.0f} z_span={selector_z_span:.3f}'
+    )
+
+    ws = sample[sample['well'] == wid]
+    for _, row in ws.iterrows():
+        ridx = int(row['row_idx'])
+        if tvt_phys is not None:
+            tvt_val = float(tvt_phys.iloc[ridx])
+        else:
+            tvt_val = float(tvt_selector[ridx])
+        rows.append({'id': row['id'], 'tvt': tvt_val})
+    print(f'  Added {len(ws)} rows')
+
+# %% cell 29
+sub_2 = pd.DataFrame(rows)
+
+# %% markdown 30: ## 6.3 Blending
+
+
+# %% cell 31
+sub = (
+    sub_1.merge(sub_2, on='id', suffixes=('_1', '_2'))
+       .assign(tvt=lambda x: 0.3 * x['tvt_1'] + 0.7 * x['tvt_2'])
+       [['id', 'tvt']]
+)
+sub.to_csv("submission.csv", index=False)
+sub
+
+# %% cell 32
+# === robust low-order PROJECTION post-processing (patched degree=4, blend=0.75) (CV-validated: raw PF -0.54, deployed components -0.33) ===
+# Runs AFTER the 0.3*ridge+0.7*selector blend writes submission.csv; OVERWRITES it with the projected
+# version. Per-well robust deg-5 fit of dU = tvt + Z - anchor vs normalized MD -> denoise jitter +
+# down-weight wrong-branch outliers. Deterministic; defensive per-well fallback to raw.
+import numpy as _np, pandas as _pd
+def _robfit(s, y, deg=5):
+    if len(s) < deg + 2:
+        return y.copy()
+    c = _np.polyfit(s, y, deg)
+    for _ in range(4):
+        r = y - _np.polyval(c, s)
+        sc = _np.median(_np.abs(r)) * 1.4826 + 1e-6
+        c = _np.polyfit(s, y, deg, w=1.0 / (1.0 + (r / (2.0 * sc)) ** 2))
+    return _np.polyval(c, s)
+try:
+    _base = _pd.read_csv("submission.csv")   # the just-written blended submission
+    assert set(['id','tvt']).issubset(_base.columns)
+    _base['well'] = _base['id'].str[:8]
+    _base['row_idx'] = _base['id'].str[9:].astype(int)
+    _out = dict(zip(_base['id'].values, _base['tvt'].astype(float).values))
+    _n_ok = 0
+    for _wid, _g in _base.groupby('well'):
+        try:
+            _hw = _pd.read_csv(CFG.dataset_path / 'test' / (_wid + '__horizontal_well.csv'))
+            _kn = _hw[_hw['TVT_input'].notna()]
+            if len(_kn) < 5:
+                continue
+            _last = _kn.iloc[-1]
+            _anchor = float(_last['TVT_input']) + float(_last['Z'])
+            _ps = float(_last['MD']); _end = float(_hw['MD'].iloc[-1])
+            _gi = _g.sort_values('row_idx')
+            _ri = _gi['row_idx'].values
+            _Z = _hw['Z'].values[_ri].astype(float)
+            _md = _hw['MD'].values[_ri].astype(float)
+            _s = (_md - _ps) / max(_end - _ps, 1e-6)
+            _tvt = _gi['tvt'].values.astype(float)
+            _fit = _robfit(_s, (_tvt + _Z) - _anchor, 4)
+            _tvt_fit_full = (_anchor + _fit) - _Z
+            _tvt_fit = 0.25 * _tvt + 0.75 * _tvt_fit_full
+            if not _np.all(_np.isfinite(_tvt_fit)):
+                continue
+            for _rid, _val in zip(_gi['id'].values, _tvt_fit):
+                _out[_rid] = float(_val)
+            _n_ok += 1
+        except Exception as _e:
+            print('proj fallback', _wid, _e)
+    print('projection applied to', _n_ok, 'wells')
+    _final = _base[['id']].copy()
+    _final['tvt'] = _final['id'].map(_out).astype(float)
+    _final[['id','tvt']].to_csv("submission.csv", index=False)
+    print('wrote projected submission.csv', _final.shape)
+except Exception as _e:
+    print('PROJECTION SKIPPED (kept blended submission):', _e)
+
+
+# %% markdown 33: # 7. Results
+
+
+# %% cell 34
+fold_scores_df = pd.DataFrame(fold_scores)
+overall_scores_df = pd.DataFrame({k: [v] for k, v in overall_scores.items()}).transpose().sort_values(by=0, ascending=True)
+order = overall_scores_df.index.tolist()
+
+min_score = overall_scores_df.values.flatten().min()
+max_score = overall_scores_df.values.flatten().max()
+padding = (max_score - min_score) * 0.5
+lower_limit = min_score - padding
+upper_limit = max_score + padding
+
+fig, axs = plt.subplots(1, 2, figsize=(15, fold_scores_df.shape[1] * 0.5))
+
+boxplot = sns.boxplot(data=fold_scores_df, order=order, ax=axs[0], orient="h", color="grey")
+axs[0].set_title(f"Fold RMSE")
+axs[0].set_xlabel("")
+axs[0].set_ylabel("")
+
+barplot = sns.barplot(x=overall_scores_df.values.flatten(), y=overall_scores_df.index, ax=axs[1], color="grey")
+axs[1].set_title(f"Overall RMSE")
+axs[1].set_xlabel("")
+axs[1].set_xlim(left=lower_limit, right=upper_limit)
+axs[1].set_ylabel("")
+
+for i, (score, model) in enumerate(zip(overall_scores_df.values.flatten(), overall_scores_df.index)):
+    color = "cyan" if "ridge" in model.lower() else "grey"
+    barplot.patches[i].set_facecolor(color)
+    boxplot.patches[i].set_facecolor(color)
+    barplot.text(score, i, round(score, 3), va="center")
+
+plt.tight_layout()
+plt.show()
+
+# %% cell: preserve sp45 output for dynamic pretrained blend
+from pathlib import Path as _BlendPath
+import pandas as _blend_pd
+_sp45_path = _BlendPath('/kaggle/working/submission.csv') if _BlendPath('/kaggle/working').exists() else _BlendPath('submission.csv')
+_sp45_df = _blend_pd.read_csv(_sp45_path)
+_sp45_df.to_csv((_BlendPath('/kaggle/working') if _BlendPath('/kaggle/working').exists() else _BlendPath('.')) / 'sp45_projection_submission.csv', index=False)
+print('saved sp45_projection_submission.csv', _sp45_df.shape, flush=True)
+
+
+# === fleongg pretrained inference section ===
+
+# %% markdown 1: # ROGII   Wellbore Geology Prediction ## Drift-resistant geosteering: a likelihood-weighted particle filter + gradient-boosting stack **Goal.** Past the *Prediction-Start* (PS) point of a horizontal well, recover the stratigraphic depth **T
+
+
+# %% cell 2
+import os, sys, glob, time, warnings, multiprocessing
+from pathlib import Path
 import numpy as np
 import pandas as pd
+from numba import njit
+from scipy.spatial import cKDTree
+from scipy.signal import savgol_filter
+from joblib import Parallel, delayed
+warnings.filterwarnings("ignore")
+os.environ.setdefault("SHOW_FIGS", "0")
 
-PF_WORKERS = max(1, min(4, (os.cpu_count() or 2) - 1))  # Kaggle CPU ~4 cores
+# ---- environment / paths (Kaggle or local) -------------------------------------
+def _find_data():
+    for c in ["/kaggle/input/competitions/rogii-wellbore-geology-prediction",
+              "/kaggle/input/rogii-wellbore-geology-prediction"]:
+        if Path(c).exists() and (Path(c)/"train").exists():
+            return Path(c)
+    # fallback: find any mounted folder that contains a train/ directory
+    for p in glob.glob("/kaggle/input/**/train", recursive=True):
+        return Path(p).parent
+    return Path(os.environ.get("ROGII_DATA", "."))   # local override for development
 
-# ── locations ─────────────────────────────────────────────────────────────────
-def find_input_dir() -> Path:
-    for root in (Path("/kaggle/input"), Path("data/raw"), Path("data")):
-        if root.exists():
-            hits = list(root.rglob("sample_submission.csv"))
-            if hits:
-                return hits[0].parent
-    raise FileNotFoundError("sample_submission.csv not found")
+class CFG:
+    DATA = _find_data()
+    OUT  = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
+    seed = 42
+    n_splits = 5
+    n_jobs = min(8, multiprocessing.cpu_count())
+    # lik-PF
+    PF_SEEDS = 128
+    PF_PARTICLES = 500
+    PF_SCALES = (3., 5., 8., 12.)
+    # FAST dev (local smoke test): limit train wells & trees
+    FAST = bool(int(os.environ.get("FAST", "0")))
+    N_TRAIN_WELLS = int(os.environ.get("N_TRAIN_WELLS", "0"))  # 0 = all
+    USE_GPU = os.environ.get("USE_GPU", "auto")
+    SHOW_FIGS = os.environ.get("SHOW_FIGS", "1") == "1"   # EDA plots (on in the notebook)
 
-
-INPUT_DIR = find_input_dir()
-TRAIN_DIR = INPUT_DIR / "train"
-TEST_DIR = INPUT_DIR / "test"
-SAMPLE_SUB_PATH = INPUT_DIR / "sample_submission.csv"
-OUT_DIR = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
-OUT_PATH = OUT_DIR / "exp026_submission.csv"
-
-PRED_COL = "pred_tvt"
-N_SPLITS = 5
-
-# blend (from local 2-way NNLS on leak-free OOF) + smoothing
-BLEND_PF = 0.683
-BLEND_GEOM = 0.392
-SMOOTH_W = 101
-
-# PF tuned config
-PF_SEEDS = 128
-PF_PARTICLES = 500
-PF_SCALE = 8.0
-PF_INIT_SPREAD = 4.0
-PF_PN = 0.01
-PF_VN = 0.002
-PF_MOM = 0.998
-PF_RP = 0.1
-PF_RR = 0.001
-PF_RESAMP = 0.5
-
-SAFE_FEATURES = [
-    "MD", "X", "Y", "Z", "GR", "is_gr_missing", "n_rows_in_well",
-    "known_length", "hidden_length", "last_known_TVT", "last_known_MD",
-    "last_known_X", "last_known_Y", "last_known_Z", "delta_MD_from_PS",
-    "delta_X_from_PS", "delta_Y_from_PS", "delta_Z_from_PS",
-    "post_ps_step", "row_frac",
-]
-GROUP_A = ["pre_ps_tvt_slope_last20", "pre_ps_tvt_slope_last5",
-           "pre_ps_tvt_curvature", "pre_ps_tvt_delta_last20"]
-GROUP_B_WELL = ["pre_ps_dZ_dMD", "pre_ps_dX_dMD", "pre_ps_dY_dMD",
-                "pre_ps_horiz_dMD", "pre_ps_azimuth"]
-GROUP_B_ROW = ["dZ_dMD_from_ps", "dX_dMD_from_ps", "dY_dMD_from_ps",
-               "horiz_disp_from_ps", "azimuth_from_ps"]
-GROUP_C = ["kh_ratio", "hidden_frac"]
-GROUP_D_WELL = ["pre_ps_gr_mean", "pre_ps_gr_std", "pre_ps_gr_last20_mean",
-                "pre_ps_gr_trend", "pre_ps_gr_available_frac"]
-GROUP_D_ROW = ["gr_vs_pre_ps_mean", "gr_z_score", "gr_rolling_mean_w20",
-               "gr_rolling_mean_w50", "gr_rolling_std_w20"]
-GROUP_F_WELL = ["f_dtvt_dmd_l50", "f_dtvt_dz_pre", "f_dtvt_dz_r2"]
-GROUP_F_ROW = ["f_extrap_slope20_dMD", "f_extrap_slope5_dMD", "f_extrap_quad_dMD",
-               "f_extrap_z", "f_extrap_disagree"]
-ALL_FEATURES = (SAFE_FEATURES + GROUP_A + GROUP_B_WELL + GROUP_B_ROW
-                + GROUP_C + GROUP_D_WELL + GROUP_D_ROW + GROUP_F_WELL + GROUP_F_ROW)
-
-
-# ── base feature reconstruction (replicates src/rogii/data/build_base.py) ─────
-def well_id_from_path(path: Path) -> str:
-    return path.name.split("__", 1)[0]
-
-
-def natural_key(path: Path):
-    return [int(x) if x.isdigit() else x for x in re.split(r"(\d+)", path.name)]
-
-
-def build_base_for_file(path: Path, split: str) -> pd.DataFrame:
-    raw = pd.read_csv(path)
-    well_id = well_id_from_path(path)
-    df = pd.DataFrame(index=raw.index)
-    df["split"] = split
-    df["well_id"] = well_id
-    df["row_idx"] = raw.index.astype("int64")
-    for col in ["MD", "X", "Y", "Z", "GR", "TVT_input", "TVT"]:
-        df[col] = raw[col] if col in raw.columns else pd.NA
-    df["TVT"] = pd.to_numeric(df["TVT"], errors="coerce")
-    df["TVT_input"] = pd.to_numeric(df["TVT_input"], errors="coerce")
-
-    missing = df["TVT_input"].isna()
-    ps_idx = int(missing.idxmax()) if missing.any() else len(df)
-    n_rows = len(df)
-    known_length = ps_idx if missing.any() else n_rows
-    hidden_length = n_rows - known_length
-    is_target = (df["row_idx"] >= ps_idx) if missing.any() else pd.Series(False, index=df.index)
-
-    anchor_idx = max(known_length - 1, 0)
-    anchor = df.loc[anchor_idx, ["MD", "X", "Y", "Z", "TVT_input"]]
-
-    df["id"] = pd.NA
-    if split == "test":
-        df.loc[is_target, "id"] = df.loc[is_target, "row_idx"].map(lambda r: f"{well_id}_{r}")
-    df["is_target"] = is_target.astype(bool)
-    df["is_known_tvt"] = df["TVT_input"].notna()
-    df["is_gr_missing"] = df["GR"].isna()
-    df["n_rows_in_well"] = int(n_rows)
-    df["known_length"] = int(known_length)
-    df["hidden_length"] = int(hidden_length)
-    df["last_known_TVT"] = anchor["TVT_input"]
-    df["last_known_MD"] = anchor["MD"]
-    df["last_known_X"] = anchor["X"]
-    df["last_known_Y"] = anchor["Y"]
-    df["last_known_Z"] = anchor["Z"]
-    df["delta_MD_from_PS"] = df["MD"] - anchor["MD"]
-    df["delta_X_from_PS"] = df["X"] - anchor["X"]
-    df["delta_Y_from_PS"] = df["Y"] - anchor["Y"]
-    df["delta_Z_from_PS"] = df["Z"] - anchor["Z"]
-    df["post_ps_step"] = (df["row_idx"] - ps_idx).clip(lower=0)
-    df["row_frac"] = df["row_idx"] / max(n_rows - 1, 1)
-    return df
-
-
-def load_base(split_dir: Path, split: str) -> pd.DataFrame:
-    paths = sorted(split_dir.glob("*__horizontal_well.csv"), key=natural_key)
-    return pd.concat([build_base_for_file(p, split) for p in paths], ignore_index=True)
-
-
-# ── Group A/B/C ───────────────────────────────────────────────────────────────
-def traj_per_well(df: pd.DataFrame) -> pd.DataFrame:
-    known = df[df["is_known_tvt"].astype(bool)]
-    recs = []
-    for wid, g in known.groupby("well_id", sort=False):
-        g = g.sort_values("row_idx")
-        md = g["MD"].to_numpy(float); x = g["X"].to_numpy(float)
-        y = g["Y"].to_numpy(float); z = g["Z"].to_numpy(float)
-        tv = g["TVT_input"].to_numpy(float); n = len(g)
-        n20 = min(20, n); n5 = min(5, n)
-        d20 = md[-1] - md[-n20] if n20 > 1 else 1.
-        d5 = md[-1] - md[-n5] if n5 > 1 else 1.
-        s20 = (tv[-1] - tv[-n20]) / d20 if abs(d20) > 1e-6 else 0.
-        s5 = (tv[-1] - tv[-n5]) / d5 if abs(d5) > 1e-6 else 0.
-        dz = (z[-1] - z[-n20]) / d20 if abs(d20) > 1e-6 else 0.
-        dx = (x[-1] - x[-n20]) / d20 if abs(d20) > 1e-6 else 0.
-        dy = (y[-1] - y[-n20]) / d20 if abs(d20) > 1e-6 else 0.
-        dx20 = x[-1] - x[-n20]; dy20 = y[-1] - y[-n20]
-        hd = float(np.sqrt(dx20 ** 2 + dy20 ** 2))
-        recs.append({"well_id": wid,
-                     "pre_ps_tvt_slope_last20": s20, "pre_ps_tvt_slope_last5": s5,
-                     "pre_ps_tvt_curvature": s5 - s20, "pre_ps_tvt_delta_last20": tv[-1] - tv[-n20],
-                     "pre_ps_dZ_dMD": dz, "pre_ps_dX_dMD": dx, "pre_ps_dY_dMD": dy,
-                     "pre_ps_horiz_dMD": hd / d20 if abs(d20) > 1e-6 else 0.,
-                     "pre_ps_azimuth": float(np.arctan2(dy20, dx20))})
-    return pd.DataFrame(recs)
-
-
-def traj_per_row(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    ms = np.where(df["delta_MD_from_PS"].to_numpy(float) < 1., 1., df["delta_MD_from_PS"].to_numpy(float))
-    df["dZ_dMD_from_ps"] = df["delta_Z_from_PS"].astype(float) / ms
-    df["dX_dMD_from_ps"] = df["delta_X_from_PS"].astype(float) / ms
-    df["dY_dMD_from_ps"] = df["delta_Y_from_PS"].astype(float) / ms
-    df["horiz_disp_from_ps"] = np.sqrt(df["delta_X_from_PS"].astype(float) ** 2
-                                       + df["delta_Y_from_PS"].astype(float) ** 2)
-    df["azimuth_from_ps"] = np.arctan2(df["delta_Y_from_PS"].astype(float),
-                                       df["delta_X_from_PS"].astype(float))
-    hl = df["hidden_length"].to_numpy(float)
-    df["kh_ratio"] = df["known_length"].astype(float) / np.where(hl < 1., 1., hl)
-    df["hidden_frac"] = hl / df["n_rows_in_well"].astype(float)
-    return df
-
-
-# ── Group D ───────────────────────────────────────────────────────────────────
-def gr_per_well(df: pd.DataFrame, global_gr_mean: float) -> pd.DataFrame:
-    known = df[df["is_known_tvt"].astype(bool)]
-    recs = []
-    for wid, g in known.groupby("well_id", sort=False):
-        g = g.sort_values("row_idx")
-        gr = g["GR"].to_numpy(float); md = g["MD"].to_numpy(float)
-        valid = ~np.isnan(gr); nv = int(valid.sum()); nt = len(gr)
-        if nv == 0:
-            recs.append({"well_id": wid, "pre_ps_gr_mean": global_gr_mean,
-                         "pre_ps_gr_std": 0., "pre_ps_gr_last20_mean": global_gr_mean,
-                         "pre_ps_gr_trend": 0., "pre_ps_gr_available_frac": 0.}); continue
-        gv = gr[valid]; mv = md[valid]; m20 = min(20, len(gv)); d_md = mv[-1] - mv[0]
-        recs.append({"well_id": wid,
-                     "pre_ps_gr_mean": float(np.nanmean(gr)),
-                     "pre_ps_gr_std": float(np.nanstd(gr)),
-                     "pre_ps_gr_last20_mean": float(gv[-m20:].mean()),
-                     "pre_ps_gr_trend": (gv[-1] - gv[0]) / d_md if abs(d_md) > 1e-6 else 0.,
-                     "pre_ps_gr_available_frac": nv / nt})
-    return pd.DataFrame(recs)
-
-
-def gr_per_row(df: pd.DataFrame, global_gr_mean: float) -> pd.DataFrame:
-    df = df.sort_values(["well_id", "row_idx"]).copy()
-    gr_f = df["GR"].copy().astype(float)
-    gr_f[gr_f.isna()] = df.loc[gr_f.isna(), "pre_ps_gr_mean"].fillna(global_gr_mean)
-    std_s = df["pre_ps_gr_std"].fillna(1.).replace(0., 1.)
-    df["gr_vs_pre_ps_mean"] = gr_f - df["pre_ps_gr_mean"].fillna(global_gr_mean)
-    df["gr_z_score"] = df["gr_vs_pre_ps_mean"] / std_s
-    df["_gr_f"] = gr_f
-    for w, c in [(20, "gr_rolling_mean_w20"), (50, "gr_rolling_mean_w50")]:
-        df[c] = df.groupby("well_id", sort=False)["_gr_f"].transform(
-            lambda x: x.rolling(w, min_periods=1).mean())
-    df["gr_rolling_std_w20"] = df.groupby("well_id", sort=False)["_gr_f"].transform(
-        lambda x: x.rolling(20, min_periods=2).std().fillna(0.))
-    return df.drop(columns=["_gr_f"])
-
-
-# ── Group F geometric extrapolation (from exp014) ─────────────────────────────
-def geom_per_well(df: pd.DataFrame) -> pd.DataFrame:
-    known = df[df["is_known_tvt"].astype(bool)]
-    recs = []
-    for wid, g in known.groupby("well_id", sort=False):
-        g = g.sort_values("row_idx")
-        md = g["MD"].to_numpy(float); z = g["Z"].to_numpy(float)
-        tv = g["TVT_input"].to_numpy(float); n = len(g)
-        n50 = min(50, n)
-        if n50 >= 2 and abs(md[-1] - md[-n50]) > 1e-6:
-            dtvt_dmd_l50 = float(np.polyfit(md[-n50:], tv[-n50:], 1)[0])
-        else:
-            dtvt_dmd_l50 = 0.0
-        if n >= 3 and np.ptp(z) > 1e-3:
-            zc = z - z.mean()
-            denom = float(np.dot(zc, zc))
-            slope_z = float(np.dot(zc, tv - tv.mean()) / denom) if denom > 1e-9 else 0.0
-            pred = slope_z * zc + tv.mean()
-            ss_res = float(np.sum((tv - pred) ** 2)); ss_tot = float(np.sum((tv - tv.mean()) ** 2))
-            r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-9 else 0.0
-        else:
-            slope_z = 0.0; r2 = 0.0
-        recs.append({"well_id": wid, "f_dtvt_dmd_l50": dtvt_dmd_l50,
-                     "f_dtvt_dz_pre": slope_z, "f_dtvt_dz_r2": r2})
-    return pd.DataFrame(recs)
-
-
-def geom_per_row(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    dmd = df["delta_MD_from_PS"].astype(float); dz = df["delta_Z_from_PS"].astype(float)
-    s20 = df["pre_ps_tvt_slope_last20"].astype(float); s5 = df["pre_ps_tvt_slope_last5"].astype(float)
-    curv = df["pre_ps_tvt_curvature"].astype(float)
-    df["f_extrap_slope20_dMD"] = s20 * dmd
-    df["f_extrap_slope5_dMD"] = s5 * dmd
-    df["f_extrap_quad_dMD"] = s20 * dmd + 0.5 * curv * dmd * dmd
-    df["f_extrap_z"] = df["f_dtvt_dz_pre"].astype(float) * dz
-    df["f_extrap_disagree"] = (df["f_extrap_slope20_dMD"] - df["f_extrap_z"]).abs()
-    return df
-
-
-def enrich(df: pd.DataFrame, global_gr_mean: float) -> pd.DataFrame:
-    df = df.merge(traj_per_well(df), on="well_id", how="left")
-    df = traj_per_row(df)
-    df = df.merge(gr_per_well(df, global_gr_mean), on="well_id", how="left")
-    df = gr_per_row(df, global_gr_mean)
-    df = df.merge(geom_per_well(df), on="well_id", how="left")
-    df = geom_per_row(df)
-    return df
-
-
-def make_folds(train: pd.DataFrame, n_splits: int = N_SPLITS) -> dict:
-    stats = (train[train["is_target"]].groupby("well_id", as_index=False)
-             .agg(target_rows=("row_idx", "size")))
-    loads = [0] * n_splits
-    fold_of = {}
-    for row in stats.sort_values("target_rows", ascending=False).itertuples(index=False):
-        f = min(range(n_splits), key=lambda i: loads[i])
-        loads[f] += int(row.target_rows)
-        fold_of[row.well_id] = f
-    return fold_of
-
-
-# ── Particle Filter (tuned) on test wells ─────────────────────────────────────
-def load_typewell(split_dir: Path, well_id: str) -> pd.DataFrame:
-    p = split_dir / f"{well_id}__typewell.csv"
-    tw = pd.read_csv(p)
-    return tw[["TVT", "GR"]].copy()
-
-
-def pf_single(tw_tvt, tw_gr, md_v, z_v, gr_v, gs, ir, last_tvt, last_Z, last_MD, seed):
-    n = len(md_v)
-    if n == 0:
-        return np.zeros(0), 0.0
-    N = PF_PARTICLES
-    rng = np.random.default_rng(seed)
-    pos = (last_tvt + last_Z) + PF_INIT_SPREAD * rng.standard_normal(N)
-    rate = ir + 0.01 * rng.standard_normal(N)
-    w = np.ones(N) / N
-    res = np.empty(n); prev_MD = last_MD; log_lik = 0.0
-    lo = tw_tvt[0] - 100; hi = tw_tvt[-1] + 100
-    for i in range(n):
-        dm_step = max(md_v[i] - prev_MD, 1.0)
-        rate = PF_MOM * rate + PF_VN * rng.standard_normal(N)
-        pos = pos + rate * dm_step + PF_PN * rng.standard_normal(N)
-        tvt_p = np.clip(pos - z_v[i], lo, hi); pos = tvt_p + z_v[i]
-        eg = np.interp(tvt_p, tw_tvt, tw_gr); d = (gr_v[i] - eg) / gs
-        lk = np.maximum(np.exp(-0.5 * np.minimum(d * d, 600.)), 1e-300)
-        log_lik += np.log(max(float((w * lk).sum()), 1e-300))
-        w = w * lk; ws = w.sum(); w = w / ws if ws > 0 else np.ones(N) / N
-        if 1.0 / (w * w).sum() < PF_RESAMP * N:
-            cum = np.cumsum(w); u0 = rng.uniform(0, 1.0 / N)
-            idx = np.clip(np.searchsorted(cum, u0 + np.arange(N) / N), 0, N - 1)
-            pos = pos[idx] + PF_RP * rng.standard_normal(N); rate = rate[idx] + PF_RR * rng.standard_normal(N)
-            w = np.ones(N) / N
-        res[i] = float(np.dot(w, pos - z_v[i])); prev_MD = md_v[i]
-    return res, log_lik
-
-
-def pf_build_payload(g: pd.DataFrame, tw: pd.DataFrame) -> dict:
-    """1 well のPF入力(numpy配列)を組み立て。pickle可能なdictで返す(マルチプロセス用)。"""
-    g = g.sort_values("row_idx")
-    known = g[g["is_known_tvt"].astype(bool)]
-    tgt = g[g["is_target"].astype(bool)]
-    wid = str(tgt["well_id"].iloc[0])
-    anchor = float(tgt["last_known_TVT"].iloc[0])
-    n = int(len(tgt))
-    if tw is None or len(tw) < 2 or len(known) < 2:
-        return {"wid": wid, "n": n, "no_tw": True, "anchor": anchor}
-    tw_s = tw.sort_values("TVT").drop_duplicates("TVT")
-    tw_tvt = tw_s["TVT"].to_numpy(float); tw_gr = tw_s["GR"].fillna(tw_s["GR"].mean()).to_numpy(float)
-    gr_full = g["GR"].interpolate(limit_direction="both").fillna(float(np.nanmean(tw_gr))).to_numpy(float)
-    tgt_mask = g["is_target"].astype(bool).to_numpy()
-    gr_v = gr_full[tgt_mask]
-    k_tvt = known["TVT_input"].to_numpy(float); k_gr = known["GR"].fillna(0).to_numpy(float)
-    gs = float(np.clip(np.nanstd(k_gr - np.interp(k_tvt, tw_tvt, tw_gr)), 10., 60.))
-    tail = known.tail(30)
-    dt = np.diff(tail["TVT_input"].to_numpy(float)); dz = np.diff(tail["Z"].to_numpy(float)); dm = np.diff(tail["MD"].to_numpy(float))
-    mm = dm > 0
-    ir = float(np.median((dt + dz)[mm] / dm[mm])) if mm.sum() >= 3 else 0.0
-    last = known.iloc[-1]
-    return {"wid": wid, "n": n, "no_tw": False, "anchor": anchor,
-            "tw_tvt": tw_tvt, "tw_gr": tw_gr,
-            "md_v": tgt["MD"].to_numpy(float), "z_v": tgt["Z"].to_numpy(float), "gr_v": gr_v,
-            "gs": gs, "ir": ir, "last_tvt": float(last["TVT_input"]),
-            "last_Z": float(last["Z"]), "last_MD": float(last["MD"])}
-
-
-def pf_worker(p: dict):
-    """1 well を 128 seed 尤度加重アンサンブル(マルチプロセスのunit)。(wid, pred) を返す。"""
-    wid = p["wid"]; n = p["n"]
-    if n == 0:
-        return wid, np.zeros(0)
-    if p.get("no_tw", False):
-        return wid, np.full(n, p["anchor"])
-    preds = np.empty((PF_SEEDS, n)); liks = np.empty(PF_SEEDS)
-    for s in range(PF_SEEDS):
-        preds[s], liks[s] = pf_single(p["tw_tvt"], p["tw_gr"], p["md_v"], p["z_v"], p["gr_v"],
-                                      p["gs"], p["ir"], p["last_tvt"], p["last_Z"], p["last_MD"], s)
-    wts = np.exp((liks - liks.max()) / PF_SCALE); wts /= wts.sum()
-    return wid, (wts[:, None] * preds).sum(0)
-
-
-# ── main ──────────────────────────────────────────────────────────────────────
-def main() -> None:
-    print(f"INPUT_DIR={INPUT_DIR}")
-    train = load_base(TRAIN_DIR, "train")
-    test = load_base(TEST_DIR, "test")
-    sample = pd.read_csv(SAMPLE_SUB_PATH)
-
-    global_gr_mean = float(train.loc[~train["is_gr_missing"].astype(bool), "GR"].mean())
-    print(f"global_gr_mean={global_gr_mean:.4f}")
-
-    # ── geom (LightGBM, 5-fold avg test) ──
-    train = enrich(train, global_gr_mean)
-    test = enrich(test, global_gr_mean)
-    fold_of = make_folds(train)
-    train["fold"] = train["well_id"].map(fold_of)
-    train_t = train[train["is_target"].astype(bool)].copy()
-    test_t = test[test["is_target"].astype(bool)].copy()
-    y_delta = train_t["TVT"].astype(float) - train_t["last_known_TVT"].astype(float)
-    params = {"objective": "regression", "metric": "rmse", "learning_rate": 0.05,
-              "num_leaves": 63, "max_depth": -1, "min_data_in_leaf": 50,
-              "feature_fraction": 0.9, "bagging_fraction": 0.9, "bagging_freq": 1,
-              "lambda_l2": 1.0, "verbosity": -1, "seed": 42, "num_threads": 4}
-    test_geom_delta = np.zeros(len(test_t), dtype=float)
-    for fold in sorted(train_t["fold"].unique()):
-        vm = train_t["fold"].eq(fold).to_numpy(); tm = ~vm
-        model = lgb.LGBMRegressor(**params, n_estimators=1500)
-        model.fit(train_t.loc[tm, ALL_FEATURES], y_delta.loc[tm],
-                  eval_set=[(train_t.loc[vm, ALL_FEATURES], y_delta.loc[vm])],
-                  eval_metric="rmse", callbacks=[lgb.early_stopping(50, verbose=False)])
-        best = int(model.best_iteration_ or model.n_estimators)
-        test_geom_delta += model.predict(test_t[ALL_FEATURES], num_iteration=best) / N_SPLITS
-        print(f"geom fold {fold}: best_iter={best}")
-    test_t = test_t.copy()
-    test_t["geom"] = test_t["last_known_TVT"].astype(float).to_numpy() + test_geom_delta
-
-    # ── PF on each test well (multiprocess over wells; CV-identical to single-thread) ──
-    payloads = []
-    for wid, g in test.groupby("well_id", sort=False):
-        if not g["is_target"].any():
+FORMATIONS = ["ANCC", "ASTNU", "ASTNL", "EGFDU", "EGFDL", "BUDA"]
+def _demo_well():
+    """A train well with TVT + a sizable eval zone, for the EDA plots."""
+    for w in sorted(p.stem.replace("__horizontal_well", "")
+                    for p in (CFG.DATA/"train").glob("*__horizontal_well.csv")):
+        try:
+            d = pd.read_csv(CFG.DATA/"train"/f"{w}__horizontal_well.csv", usecols=["TVT", "TVT_input"])
+        except Exception:
             continue
-        payloads.append(pf_build_payload(g, load_typewell(TEST_DIR, wid)))
-    n_wells = len(payloads)
-    print(f"PF: {n_wells} test wells, workers={PF_WORKERS}, seeds={PF_SEEDS}")
-    pf_by_wid = {}
-    if PF_WORKERS > 1 and n_wells > 1:
-        with ProcessPoolExecutor(max_workers=PF_WORKERS) as ex:
-            for k, (wid, pred) in enumerate(ex.map(pf_worker, payloads, chunksize=1)):
-                pf_by_wid[wid] = pred
-                if (k + 1) % 50 == 0:
-                    print(f"  PF {k+1}/{n_wells} wells", flush=True)
+        if "TVT" in d and d.TVT.notna().any() and d.TVT_input.isna().sum() > 2000:
+            return w
+    return None
+print("DATA:", CFG.DATA, "| OUT:", CFG.OUT, "| cores:", CFG.n_jobs, "| FAST:", CFG.FAST)
+
+def load_well(wid, split="train"):
+    base = CFG.DATA / split
+    hw = pd.read_csv(base / f"{wid}__horizontal_well.csv")
+    tw = pd.read_csv(base / f"{wid}__typewell.csv").sort_values("TVT")
+    return hw, tw
+
+def rmse(a, b):
+    return float(np.sqrt(np.mean((np.asarray(a, float) - np.asarray(b, float))**2)))
+
+# %% markdown 3: ## 1   The problem, visually A horizontal well drills a *build* section (the bit turns to horizontal) and then a long *lateral*. TVT is known up to PS (it equals `TVT_input`) and must be predicted afterwards. As the bit moves up/down throug
+
+
+# %% cell 4
+def fig_overview(wid):
+    import matplotlib.pyplot as plt
+    hw, tw = load_well(wid)
+    kn = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]; ps = kn.MD.iloc[-1]
+    fig, ax = plt.subplots(3, 1, figsize=(12, 8.5), sharex=True)
+    ax[0].plot(hw.MD, hw.Z, lw=1.2, color="#333"); ax[0].axvline(ps, color="crimson", ls="--", label="PS")
+    ax[0].set_ylabel("Z / TVD (ft)"); ax[0].legend(loc="upper right")
+    ax[0].set_title(f"Well {wid}: trajectory   gamma-ray   TVT target")
+    ax[1].plot(kn.MD, kn.GR, lw=.7, color="steelblue", label="GR known")
+    ax[1].plot(ev.MD, ev.GR, lw=.7, color="darkorange", label="GR eval"); ax[1].axvline(ps, color="crimson", ls="--")
+    ax[1].set_ylabel("GR (API)"); ax[1].legend(loc="upper right")
+    ax[2].plot(kn.MD, kn.TVT, lw=1.6, color="seagreen", label="TVT known (=input)")
+    ax[2].plot(ev.MD, ev.TVT, lw=1.6, color="crimson", label="TVT to predict"); ax[2].axvline(ps, color="crimson", ls="--")
+    ax[2].set_ylabel("TVT (ft)"); ax[2].set_xlabel("MD (ft)"); ax[2].invert_yaxis(); ax[2].legend(loc="upper right")
+    for a in ax: a.grid(alpha=.25)
+    plt.tight_layout(); plt.show()
+
+def fig_correlation(wid):
+    import matplotlib.pyplot as plt
+    hw, tw = load_well(wid); ev = hw[hw.TVT_input.isna()]
+    fig, ax = plt.subplots(1, 2, figsize=(11, 6))
+    ax[0].plot(tw.GR, tw.TVT, lw=1.0, color="black")
+    ax[0].set_xlabel("GR (API)"); ax[0].set_ylabel("TVT (ft)"); ax[0].invert_yaxis()
+    ax[0].set_title("Typewell signature: GR vs TVT")
+    sc = ax[1].scatter(ev.GR, ev.TVT, s=4, c=ev.MD, cmap="viridis")
+    ax[1].set_xlabel("GR (API)"); ax[1].set_ylabel("TVT (ft)"); ax[1].invert_yaxis()
+    ax[1].set_title("Horizontal GR at its true TVT\nmatches the typewell signature")
+    plt.colorbar(sc, ax=ax[1], label="MD (ft)")
+    for a in ax: a.grid(alpha=.25)
+    plt.tight_layout(); plt.show()
+
+def fig_drift_tail(n_wells=250):
+    import matplotlib.pyplot as plt
+    wids = sorted(p.stem.replace("__horizontal_well", "") for p in (CFG.DATA/"train").glob("*__horizontal_well.csv"))
+    rng = np.random.default_rng(1); samp = sorted(rng.choice(wids, min(n_wells, len(wids)), replace=False).tolist())
+    per = []
+    for wid in samp:
+        try: hw = pd.read_csv(CFG.DATA/"train"/f"{wid}__horizontal_well.csv", usecols=["TVT_input", "TVT"])
+        except: continue
+        ev = hw[hw.TVT_input.isna()]; kn = hw[hw.TVT_input.notna()]
+        if len(ev) == 0 or len(kn) < 10 or hw.TVT.isna().all(): continue
+        t = ev.TVT.values
+        if np.isnan(t).any(): continue
+        per.append(np.sqrt(np.mean((t-kn.TVT_input.iloc[-1])**2)))
+    per = np.array(per); srt = np.sort(per)[::-1]; cum = np.cumsum(srt**2)/np.sum(srt**2)
+    fig, ax = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax[0].hist(per, bins=40, color="indianred", alpha=.85)
+    ax[0].axvline(np.median(per), color="k", ls="--", label=f"median={np.median(per):.1f}")
+    ax[0].axvline(per.mean(), color="b", ls="--", label=f"mean={per.mean():.1f}")
+    ax[0].set_xlabel("per-well last-known-baseline RMSE (ft)"); ax[0].set_ylabel("wells"); ax[0].legend()
+    ax[0].set_title("Per-well error is heavily right-skewed")
+    ax[1].plot(np.arange(1, len(srt)+1)/len(srt)*100, cum*100, color="purple"); ax[1].axhline(80, color="gray", ls=":")
+    ax[1].set_xlabel("% of wells (worst first)"); ax[1].set_ylabel("% of pooled squared error")
+    ax[1].set_title("A few drift wells dominate the metric")
+    for a in ax: a.grid(alpha=.25)
+    plt.tight_layout(); plt.show()
+
+# %% cell 5
+DEMO = "00bbac68" if (CFG.DATA/"train"/"00bbac68__horizontal_well.csv").exists() else _demo_well()
+if CFG.SHOW_FIGS:
+    print("demo well:", DEMO)
+    if DEMO:
+        fig_overview(DEMO)
+        fig_correlation(DEMO)
+    fig_drift_tail()
+
+# %% markdown 6: ## 2   Trackers   recovering TVT from GR We build several *independent* estimates of TVT(MD), then let a GBM combine them. * **Particle filter (PF)**   a sequential Monte-Carlo tracker: particles carry a TVT and a TVT-rate; at each step the
+
+
+# %% cell 7
+# ---- single particle filters (ANCC-anchored & Z-velocity-coupled), numba ---------
+PF_N = 600; ANCC_N = 600
+PF_MOM = 0.993; PF_VN = 0.005; PF_PN = 0.01
+PF_GR_SIG_MIN = 10.; PF_GR_SIG_MAX = 60.; PF_GR_SIG_DEF = 30.
+PF_GR_WIN = 5; PF_GR_WT = 0.3; PF_RESAMP = 0.5; PF_ROUGH_P = 0.2; PF_ROUGH_V = 0.003
+ANCC_ALPHA = 0.998; ANCC_RN = 0.002; ANCC_PN = 0.005; ANCC_IS = 0.3; ANCC_RP = 0.1; ANCC_RR = 0.001
+
+BEAMS = [(10,20.,144.,2,"cons"),(10,8.,64.,2,"loose"),(8,35.,220.,1,"vcons"),
+         (10,14.,90.,5,"sm5"),(20,4.,36.,3,"vloose"),(12,12.,100.,3,"mid"),(15,25.,180.,2,"stiff")]
+
+@njit(cache=True)
+def _interp1(grid, v, vmin, step):
+    i = int((v - vmin) / step)
+    if i < 0: return grid[0]
+    n = len(grid) - 1
+    if i >= n: return grid[n]
+    t = (v - vmin) / step - i
+    return grid[i]*(1.-t) + grid[i+1]*t
+
+@njit(cache=True)
+def _resamp(pos, aux, w, N, rp, rv):
+    cum = np.zeros(N+1)
+    for j in range(N): cum[j+1] = cum[j]+w[j]
+    u0 = np.random.uniform(0., 1./N); np2 = np.empty(N); na = np.empty(N); ci = 0
+    for j in range(N):
+        u = u0+j/N
+        while ci < N-1 and cum[ci+1] < u: ci += 1
+        np2[j] = pos[ci]+rp*np.random.randn(); na[j] = aux[ci]+rv*np.random.randn()
+    return np2, na
+
+@njit(cache=True)
+def _beam_jit(sgr, tw_gr, si, BS, mc, es):
+    n = len(sgr); nt = len(tw_gr); MAX = BS*6
+    bidx = np.zeros(BS, np.int64); bidx[0] = si
+    bcost = np.full(BS, 1e30); bcost[0] = 0.; bn = np.int64(1)
+    hI = np.zeros((n, BS), np.int64); hP = np.zeros((n, BS), np.int64)
+    cI = np.zeros(MAX, np.int64); cC = np.full(MAX, 1e30); cP = np.zeros(MAX, np.int64)
+    for step in range(n):
+        gv = sgr[step]; nc = np.int64(0)
+        for bi in range(bn):
+            idx = bidx[bi]; cost = bcost[bi]
+            for d in range(-2, 3):
+                ni = idx+d
+                if ni < 0 or ni >= nt: continue
+                tot = cost+(gv-tw_gr[ni])**2/es+mc*(d if d >= 0 else -d)
+                fnd = np.int64(-1)
+                for ci in range(nc):
+                    if cI[ci] == ni: fnd = ci; break
+                if fnd >= 0:
+                    if tot < cC[fnd]: cC[fnd] = tot; cP[fnd] = bi
+                else:
+                    if nc < MAX: cI[nc] = ni; cC[nc] = tot; cP[nc] = bi; nc += 1
+        kept = min(BS, nc)
+        for i in range(kept):
+            mi = i
+            for j in range(i+1, nc):
+                if cC[j] < cC[mi]: mi = j
+            if mi != i:
+                cI[i], cI[mi] = cI[mi], cI[i]; cC[i], cC[mi] = cC[mi], cC[i]; cP[i], cP[mi] = cP[mi], cP[i]
+        hI[step, :kept] = cI[:kept]; hP[step, :kept] = cP[:kept]
+        bidx[:kept] = cI[:kept]; bcost[:kept] = cC[:kept]; bn = kept
+    best = np.int64(0)
+    for b in range(1, bn):
+        if bcost[b] < bcost[best]: best = b
+    path = np.zeros(n, np.int64); b = best
+    for s in range(n-1, -1, -1): path[s] = hI[s, b]; b = hP[s, b]
+    return path
+
+@njit(cache=True)
+def _pf_ancc(md_v, z_v, gr_v, gg, vmin, step, gs, ls, ir, N, ALPHA, RN, PN, IS, RP, RR, RESAMP):
+    pos = np.empty(N); rate = np.empty(N); w = np.ones(N)/N
+    for j in range(N):
+        pos[j] = ls+IS*np.random.randn(); rate[j] = ir+0.01*np.random.randn()
+    pts = np.empty(len(md_v)); std_ = np.empty(len(md_v)); pm = md_v[0]-1.
+    for i in range(len(md_v)):
+        dm = md_v[i]-pm; dm = max(dm, 1.)
+        for j in range(N):
+            rate[j] = ALPHA*rate[j]+RN*np.random.randn(); pos[j] += rate[j]*dm+PN*np.random.randn()
+            tvt_j = pos[j]-z_v[i]; tvt_j = max(tvt_j, vmin-50.); tvt_j = min(tvt_j, vmin+len(gg)*step+50.)
+            pos[j] = tvt_j+z_v[i]
+        if not np.isnan(gr_v[i]):
+            ws = 0.
+            for j in range(N):
+                eg = _interp1(gg, pos[j]-z_v[i], vmin, step); d = (gr_v[i]-eg)/gs
+                lk = max(np.exp(-0.5*d*d) if d*d < 600. else 0., 1e-300); w[j] *= lk; ws += w[j]
+            if ws > 0.:
+                for j in range(N): w[j] /= ws
+            else:
+                for j in range(N): w[j] = 1./N
+        ne = 0.
+        for j in range(N): ne += w[j]*w[j]
+        if 1./ne < RESAMP*N:
+            pos, rate = _resamp(pos, rate, w, N, RP, RR)
+            for j in range(N): w[j] = 1./N
+        tv = 0.
+        for j in range(N): tv += w[j]*(pos[j]-z_v[i])
+        pts[i] = tv; va = 0.
+        for j in range(N): va += w[j]*(pos[j]-z_v[i]-tv)**2
+        std_[i] = va**0.5; pm = md_v[i]
+    return pts, std_
+
+@njit(cache=True)
+def _pf_z(md_v, z_v, gr_v, gr_sm_v, gg_p, gg_s, vmin, step, gs, ip, iv, beta, icpt, zsig, N,
+         MOM, VN, PN, GR_WT, RP, RV, RESAMP):
+    pos = np.empty(N); vel = np.empty(N); w = np.ones(N)/N
+    for j in range(N):
+        pos[j] = ip+0.5*np.random.randn(); vel[j] = iv+0.02*np.random.randn()
+    pts = np.empty(len(md_v)); std_ = np.empty(len(md_v)); pm = md_v[0]-1.; pz = z_v[0]-1.
+    for i in range(len(md_v)):
+        dm = md_v[i]-pm; dm = max(dm, 1.); dzd = (z_v[i]-pz)/dm; ve = beta*dzd+icpt
+        for j in range(N):
+            vel[j] = MOM*vel[j]+VN*np.random.randn(); pos[j] += vel[j]*dm+PN*np.random.randn()
+            pos[j] = max(pos[j], vmin-50.); pos[j] = min(pos[j], vmin+len(gg_p)*step+50.)
+        if not np.isnan(gr_v[i]):
+            ws = 0.
+            for j in range(N):
+                ep = _interp1(gg_p, pos[j], vmin, step); dp = (gr_v[i]-ep)/gs
+                lp = max(np.exp(-0.5*dp*dp) if dp*dp < 600. else 0., 1e-300)
+                if not np.isnan(gr_sm_v[i]):
+                    es = _interp1(gg_s, pos[j], vmin, step); ds = (gr_sm_v[i]-es)/(gs*1.5)
+                    lsm = max(np.exp(-0.5*ds*ds) if ds*ds < 600. else 0., 1e-300); lk = (1.-GR_WT)*lp+GR_WT*lsm
+                else: lk = lp
+                lk = max(lk, 1e-300); w[j] *= lk; ws += w[j]
+            if ws > 0.:
+                for j in range(N): w[j] /= ws
+            else:
+                for j in range(N): w[j] = 1./N
+        ws2 = 0.
+        for j in range(N):
+            dv = (vel[j]-ve)/max(zsig*2., 0.005); lz = max(np.exp(-0.5*dv*dv) if dv*dv < 600. else 0., 1e-300)
+            w[j] *= lz; ws2 += w[j]
+        if ws2 > 0.:
+            for j in range(N): w[j] /= ws2
+        else:
+            for j in range(N): w[j] = 1./N
+        ne = 0.
+        for j in range(N): ne += w[j]*w[j]
+        if 1./ne < RESAMP*N:
+            pos, vel = _resamp(pos, vel, w, N, RP, RV)
+            for j in range(N): w[j] = 1./N
+        wm = 0.
+        for j in range(N): wm += w[j]*pos[j]
+        pts[i] = wm; va = 0.
+        for j in range(N): va += w[j]*(pos[j]-wm)**2
+        std_[i] = va**0.5; pm = md_v[i]; pz = z_v[i]
+    return pts, std_
+
+def _grid(tw_tvt, tw_gr, step=0.2):
+    tmin = float(tw_tvt.min()); tmax = float(tw_tvt.max())
+    tvt_g = np.arange(tmin, tmax+step, step)
+    return np.interp(tvt_g, tw_tvt, tw_gr).astype(np.float64), float(tmin), float(step)
+
+def _gr_sig(hw, tw_tvt, tw_gr):
+    kn = hw[hw.TVT_input.notna() & hw.GR.notna()]
+    if len(kn) < 20: return float(PF_GR_SIG_DEF)
+    return float(np.clip(np.std(kn.GR.values-np.interp(kn.TVT_input.values, tw_tvt, tw_gr)),
+                         PF_GR_SIG_MIN, PF_GR_SIG_MAX))
+
+def _nn(arr, v):
+    i = int(np.searchsorted(arr, v, "left"))
+    if i >= len(arr): return len(arr)-1
+    if i > 0 and abs(arr[i-1]-v) <= abs(arr[i]-v): return i-1
+    return i
+
+def _smooth(vals, fb, r):
+    s = pd.Series(vals, dtype="float32").interpolate(limit_direction="both").fillna(fb)
+    return (s.rolling(r*2+1, center=True, min_periods=1).mean() if r > 0 else s).to_numpy(np.float32)
+
+def beam_search(gr_h, tw_tvt, tw_gr, start_tvt, bs, mc, es, r):
+    si = _nn(tw_tvt, start_tvt); sgr = _smooth(gr_h, float(np.nanmean(tw_gr)), r).astype(np.float64)
+    return tw_tvt[_beam_jit(sgr, tw_gr.astype(np.float64), si, bs, float(mc), float(es))].astype(np.float32)
+
+def run_pf_ancc(hw, tw_tvt, tw_gr, N=ANCC_N):
+    gs = _gr_sig(hw, tw_tvt, tw_gr); kn = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]
+    if len(ev) == 0: return np.array([]), np.array([])
+    ls = float(kn.TVT_input.iloc[-1]+kn.Z.iloc[-1])
+    tail = kn.tail(30); dt = np.diff(tail.TVT_input.values); dz = np.diff(tail.Z.values); dm = np.diff(tail.MD.values); m = dm > 0
+    ir = float(np.median((dt+dz)[m]/dm[m])) if m.sum() >= 3 else 0.
+    gg, gmin, gst = _grid(tw_tvt, tw_gr)
+    pts, std = _pf_ancc(ev.MD.values.astype(np.float64), ev.Z.values.astype(np.float64), ev.GR.values.astype(np.float64),
+                        gg, gmin, gst, gs, ls, ir, N, ANCC_ALPHA, ANCC_RN, ANCC_PN, ANCC_IS, ANCC_RP, ANCC_RR, PF_RESAMP)
+    return pts.astype(np.float32), std.astype(np.float32)
+
+def run_pf_z(hw, tw_tvt, tw_gr, N=PF_N):
+    gs = _gr_sig(hw, tw_tvt, tw_gr); tw_s = pd.Series(tw_gr).rolling(PF_GR_WIN, center=True, min_periods=1).mean().values.astype(np.float32)
+    kna = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]
+    if len(ev) == 0: return np.array([]), np.array([])
+    dz_k = np.diff(kna.Z.values); dvt = np.diff(kna.TVT_input.values); dmd_k = np.diff(kna.MD.values); m2 = dmd_k > 0
+    if m2.sum() >= 10:
+        vz = dz_k[m2]/dmd_k[m2]; vt = dvt[m2]/dmd_k[m2]; A = np.column_stack([vz, np.ones_like(vz)])
+        c, _, _, _ = np.linalg.lstsq(A, vt, rcond=None)
+        beta, icpt, zsig = float(c[0]), float(c[1]), max(float(np.std(vt-(c[0]*vz+c[1]))), 0.001)
+    else: beta, icpt, zsig = -1., 0., 0.1
+    t2 = kna.tail(20); dvt2 = np.diff(t2.TVT_input.values); dmd2 = np.diff(t2.MD.values); m3 = dmd2 > 0
+    iv = float(np.median(dvt2[m3]/dmd2[m3])) if m3.sum() >= 3 else 0.
+    gg, gmin, gst = _grid(tw_tvt, tw_gr); gs2, _, _ = _grid(tw_tvt, tw_s)
+    gr_sm = hw.GR.rolling(PF_GR_WIN, center=True, min_periods=1).mean()
+    pts, std = _pf_z(ev.MD.values.astype(np.float64), ev.Z.values.astype(np.float64), ev.GR.values.astype(np.float64),
+                     gr_sm.loc[ev.index].values.astype(np.float64), gg, gs2, gmin, gst, gs,
+                     float(kna.TVT_input.iloc[-1]), iv, beta, icpt, zsig, N,
+                     PF_MOM, PF_VN, PF_PN, PF_GR_WT, PF_ROUGH_P, PF_ROUGH_V, PF_RESAMP)
+    return pts.astype(np.float32), std.astype(np.float32)
+
+def multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3):
+    out = []
+    for hw in hws:
+        win = 2*hw+1; nk = len(kgr); nh = len(hgr)
+        if nk < win+1 or nh == 0:
+            out.append((np.full(nh, ktvt[-1], np.float32), np.zeros(nh, np.float32))); continue
+        kg = pd.Series(kgr).rolling(5, center=True, min_periods=1).mean().values.astype(np.float32)
+        hg = pd.Series(hgr).rolling(5, center=True, min_periods=1).mean().values.astype(np.float32)
+        sts = np.arange(0, nk-win+1, stride, dtype=np.int32)
+        if len(sts) == 0:
+            out.append((np.full(nh, ktvt[-1], np.float32), np.zeros(nh, np.float32))); continue
+        C = kg[sts[:, None]+np.arange(win, dtype=np.int32)[None, :]].astype(np.float32)
+        Cn = (C-C.mean(1, keepdims=True))/(C.std(1, keepdims=True)+1e-6)
+        hp = np.pad(hg, hw, mode="edge"); H = hp[np.arange(nh)[:, None]+np.arange(win)[None, :]].astype(np.float32)
+        Hn = (H-H.mean(1, keepdims=True))/(H.std(1, keepdims=True)+1e-6)
+        ncc = Hn@Cn.T/win; best = ncc.argmax(1); score = ncc.max(1).astype(np.float32)
+        out.append((ktvt[np.clip(sts[best]+hw, 0, nk-1)].astype(np.float32), score))
+    tvts = np.stack([o[0] for o in out], 1); scores = np.stack([o[1] for o in out], 1)
+    sw = np.exp(3.*scores); sw /= sw.sum(1, keepdims=True)+1e-9
+    return out, (tvts*sw).sum(1).astype(np.float32)
+
+# %% cell 8
+# ---- 128-seed likelihood-weighted particle filter (the workhorse), numba ---------
+@njit(cache=True, nogil=True)
+def _pf_lik_allseeds(md_v, z_v, gr_v, gg, vmin, step, gs, ls, ir, N, n_seeds, seed_base,
+                     MOM, VN, PN, RP, RR, RESAMP, init_spr):
+    n = len(md_v); preds = np.empty((n_seeds, n)); liks = np.empty(n_seeds); tmax = vmin + len(gg)*step
+    for s in range(n_seeds):
+        np.random.seed(seed_base + s)
+        pos = np.empty(N); rate = np.empty(N); w = np.ones(N)/N
+        for j in range(N):
+            pos[j] = ls + init_spr*np.random.randn(); rate[j] = ir + 0.01*np.random.randn()
+        log_lik = 0.0; prev_md = md_v[0] - 1.0
+        for i in range(n):
+            dm = md_v[i] - prev_md
+            if dm < 1.0: dm = 1.0
+            for j in range(N):
+                rate[j] = MOM*rate[j] + VN*np.random.randn(); pos[j] += rate[j]*dm + PN*np.random.randn()
+                tvt_j = pos[j] - z_v[i]
+                if tvt_j < vmin-100.: tvt_j = vmin-100.
+                if tvt_j > tmax+100.: tvt_j = tmax+100.
+                pos[j] = tvt_j + z_v[i]
+            avg_lk = 0.0
+            for j in range(N):
+                eg = _interp1(gg, pos[j]-z_v[i], vmin, step); d = (gr_v[i]-eg)/gs; dd = d*d
+                if dd > 600.: dd = 600.
+                lk = np.exp(-0.5*dd)
+                if lk < 1e-300: lk = 1e-300
+                avg_lk += w[j]*lk; w[j] = w[j]*lk
+            if avg_lk < 1e-300: avg_lk = 1e-300
+            log_lik += np.log(avg_lk)
+            ws = 0.0
+            for j in range(N): ws += w[j]
+            if ws > 0.0:
+                for j in range(N): w[j] /= ws
+            else:
+                for j in range(N): w[j] = 1./N
+            neff = 0.0
+            for j in range(N): neff += w[j]*w[j]
+            neff = 1.0/neff
+            if neff < RESAMP*N:
+                cum = np.empty(N); c = 0.0
+                for j in range(N): c += w[j]; cum[j] = c
+                u0 = np.random.uniform(0., 1./N); newpos = np.empty(N); newrate = np.empty(N); ci = 0
+                for j in range(N):
+                    u = u0 + j/N
+                    while ci < N-1 and cum[ci] < u: ci += 1
+                    newpos[j] = pos[ci] + RP*np.random.randn(); newrate[j] = rate[ci] + RR*np.random.randn()
+                for j in range(N): pos[j] = newpos[j]; rate[j] = newrate[j]; w[j] = 1./N
+            est = 0.0
+            for j in range(N): est += w[j]*(pos[j]-z_v[i])
+            preds[s, i] = est; prev_md = md_v[i]
+        liks[s] = log_lik
+    return preds, liks
+
+def lik_pf(hw, tw, n_particles=CFG.PF_PARTICLES, n_seeds=CFG.PF_SEEDS, scales=CFG.PF_SCALES,
+           init_spr=4.5, seed_base=0, with_quality=False):
+    """Likelihood-weighted PF ensemble. Returns ({pf_scale_X: pred_eval}, ev_index[, quality])."""
+    tw_s = tw.sort_values("TVT"); tw_tvt = tw_s.TVT.values.astype(float)
+    tw_gr = tw_s.GR.fillna(tw_s.GR.mean()).values.astype(float)
+    kn = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]
+    if len(ev) == 0: return {}, np.array([]), {}
+    last = kn.iloc[-1]; ls = float(last.TVT_input) + float(last.Z)
+    tw_at_k = np.interp(kn.TVT_input.values, tw_tvt, tw_gr)
+    gs = float(np.clip(np.nanstd(kn.GR.fillna(0).values - tw_at_k), 10., 60.))
+    tail = kn.tail(30); dt = np.diff(tail.TVT_input.values); dz = np.diff(tail.Z.values); dm = np.diff(tail.MD.values); m = dm > 0
+    ir = float(np.median((dt+dz)[m]/dm[m])) if m.sum() >= 3 else 0.0
+    gg, gmin, gst = _grid(tw_tvt, tw_gr)
+    gr_v = hw.GR.interpolate(limit_direction="both").fillna(tw_gr.mean()).values.astype(float)[ev.index]
+    preds, liks = _pf_lik_allseeds(ev.MD.values.astype(float), ev.Z.values.astype(float), gr_v,
+                                   gg, gmin, gst, gs, ls, ir, n_particles, n_seeds, seed_base,
+                                   0.998, 0.002, 0.005, 0.1, 0.001, 0.5, init_spr)
+    ln = liks - liks.max(); out = {}
+    for sc in scales:
+        wts = np.exp(ln/float(sc)); wts /= wts.sum(); out[f"pf_scale_{sc:g}"] = (wts[:, None]*preds).sum(0)
+    out["pf_mean"] = preds.mean(0)
+    q = {}
+    if with_quality:
+        q = {"pf_best_ll": float(liks.max())/len(ev), "pf_ll_spread": float(liks.std()),
+             "pf_pt_std": preds.std(0).astype(np.float32), "pf_gr_sig": gs}
+    return out, ev.index.values, q
+
+# JIT warm-up so timings below are representative
+_m = np.linspace(1, 50, 20); _z = np.zeros(20); _g = np.full(20, 50.); _gg = np.linspace(45, 55, 100)
+_pf_ancc(_m, _z, _g, _gg, 45., .1, 20., 50., 0., 8, .998, .002, .005, .3, .1, .001, .5)
+_pf_z(_m, _z, _g, _g, _gg, _gg, 45., .1, 20., 50., 0., -1., 0., .1, 8, .993, .005, .01, .3, .2, .003, .5)
+_beam_jit(np.random.randn(30), np.random.randn(50), 25, 8, 15., 100.)
+_pf_lik_allseeds(_m, _z, _g, _gg, 45., .1, 20., 50., 0., 64, 4, 0, .998, .002, .005, .1, .001, .5, 4.5)
+print("trackers compiled.")
+
+def fig_tracker_vs_truth(wid):
+    import matplotlib.pyplot as plt
+    hw, tw = load_well(wid); kn = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]
+    tw_tvt = tw.TVT.to_numpy(np.float32); tw_gr = tw.GR.to_numpy(np.float32); last = float(kn.TVT_input.iloc[-1])
+    pf, _ = run_pf_ancc(hw, tw_tvt, tw_gr); out, _, _ = lik_pf(hw, tw, scales=(3.,))
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.plot(ev.MD, ev.TVT, lw=2.2, color="black", label="True TVT", zorder=5)
+    ax.plot(ev.MD, np.full(len(ev), last), lw=1.1, color="gray", ls=":", label="last-known baseline")
+    ax.plot(ev.MD, pf, lw=1.0, color="tab:blue", alpha=.8, label="single particle filter")
+    ax.plot(ev.MD, out["pf_scale_3"], lw=1.5, color="crimson", alpha=.9, label="128-seed lik-weighted PF")
+    ax.set_xlabel("MD (ft)"); ax.set_ylabel("TVT (ft)"); ax.invert_yaxis(); ax.grid(alpha=.25)
+    ax.set_title(f"Well {wid}: trackers vs ground truth   the lik-PF resists drift"); ax.legend(loc="best")
+    plt.tight_layout(); plt.show()
+
+# %% cell 9
+if CFG.SHOW_FIGS and DEMO:
+    fig_tracker_vs_truth(DEMO)
+
+# %% markdown 10: ## 3   Offset-well spatial priors "Geological dips behave similarly in neighbouring wells." We fit, from nearby wells, (a) a local **plane** through each formation top and (b) a **dense ANCC surface**, by inverse-distance / least-squares KN
+
+
+# %% cell 11
+PLANE_K = 10; DENSE_SPW = 60; DENSE_K = 20
+
+def robust_slope(x, y):
+    x = np.asarray(x, float); y = np.asarray(y, float); m = np.isfinite(x) & np.isfinite(y)
+    if m.sum() < 2 or np.std(x[m]) < 1e-6: return 0.
+    return float(np.polyfit(x[m], y[m], 1)[0])
+
+def affine_cal(kgr, tw_at_k, min_pts=20):
+    v = np.isfinite(kgr) & np.isfinite(tw_at_k)
+    if v.sum() < min_pts or np.std(tw_at_k[v]) < 1e-6:
+        return 1., float(np.nanmean(kgr)-np.nanmean(tw_at_k)) if v.any() else 0.
+    a, b = np.polyfit(tw_at_k[v], kgr[v], 1); return float(a), float(b)
+
+def seg_b_well(ktvt, kz, form_col):
+    bv = ktvt+kz-form_col; n = len(bv); b_full = float(np.median(bv))
+    b_late = float(np.median(bv[max(0, n-50):])) if n >= 5 else b_full
+    t1, t2 = n//3, 2*n//3
+    b_early = float(np.median(bv[:max(1, t1)])) if t1 > 0 else b_full
+    b_mid = float(np.median(bv[t1:max(t1+1, t2)])) if t2 > t1 else b_full
+    w = np.exp(0.02*np.arange(n)); w /= w.sum()
+    return b_full, b_early, b_mid, b_late, float(np.dot(w, bv))
+
+class FormationPlaneKNN:
+    def __init__(self, well_ids, data_dir):
+        rows = []
+        for wid in well_ids:
+            try: df = pd.read_csv(data_dir/f"{wid}__horizontal_well.csv", usecols=["X","Y"]+FORMATIONS).dropna()
+            except: continue
+            if len(df) == 0: continue
+            row = {"wid": wid, "x": float(df.X.median()), "y": float(df.Y.median())}
+            for c in FORMATIONS: row[f"{c}_m"] = float(df[c].median())
+            rows.append(row)
+        self.df = pd.DataFrame(rows); self.wmap = {w: i for i, w in enumerate(self.df.wid)}
+        xy = self.df[["x","y"]].to_numpy(); self.scale = np.where(xy.std(0) < 1e-3, 1., xy.std(0))
+        self.tree = cKDTree(xy/self.scale); self.xa = self.df.x.to_numpy(); self.ya = self.df.y.to_numpy()
+        self.fa = self.df[[f"{c}_m" for c in FORMATIONS]].to_numpy(np.float64)
+    def impute(self, xy_q, self_wid=None, k=PLANE_K):
+        q = xy_q/self.scale; nf = min(k+5, len(self.df)); dist, idx = self.tree.query(q, k=nf, workers=-1)
+        if self_wid in self.wmap: dist = np.where(idx == self.wmap[self_wid], np.inf, dist)
+        ordr = np.argpartition(dist, min(k-1, nf-1), 1)[:, :k]
+        dk = np.take_along_axis(dist, ordr, 1); ik = np.take_along_axis(idx, ordr, 1)
+        vk = np.isfinite(dk); w = np.where(vk, 1./(dk+1e-3), 0.).astype(np.float64)
+        xn = self.xa[ik]; yn = self.ya[ik]; fn = self.fa[ik]; wx = w*xn; wy = w*yn
+        A = np.zeros((len(q), 3, 3))
+        A[:,0,0]=(wx*xn).sum(1); A[:,0,1]=(wx*yn).sum(1); A[:,0,2]=wx.sum(1)
+        A[:,1,0]=A[:,0,1]; A[:,1,1]=(wy*yn).sum(1); A[:,1,2]=wy.sum(1)
+        A[:,2,0]=A[:,0,2]; A[:,2,1]=A[:,1,2]; A[:,2,2]=w.sum(1)
+        A[:,0,0]+=1e-9; A[:,1,1]+=1e-9; A[:,2,2]+=1e-9
+        rhs = np.stack([(wx[:,:,None]*fn).sum(1), (wy[:,:,None]*fn).sum(1), (w[:,:,None]*fn).sum(1)], 1)
+        try: coef = np.linalg.solve(A, rhs)
+        except:
+            coef = np.zeros((len(q), 3, 6))
+            for r in range(len(q)):
+                try: coef[r] = np.linalg.pinv(A[r])@rhs[r]
+                except: pass
+        Xq = xy_q[:,0]; Yq = xy_q[:,1]
+        pred = (Xq[:,None]*coef[:,0,:]+Yq[:,None]*coef[:,1,:]+coef[:,2,:]).astype(np.float32)
+        pred[~vk.any(1)] = self.fa.mean(0)
+        return pred, np.where(vk, dk, np.inf).min(1).astype(np.float32)
+
+class DenseANCCImputer:
+    def __init__(self, well_ids, data_dir, spw=DENSE_SPW):
+        xs, ys, an, wd = [], [], [], []
+        for wid in well_ids:
+            try: df = pd.read_csv(data_dir/f"{wid}__horizontal_well.csv", usecols=["X","Y","ANCC"]).dropna()
+            except: continue
+            if len(df) == 0: continue
+            ix = np.linspace(0, len(df)-1, min(spw, len(df)), dtype=int); s = df.iloc[ix]
+            xs.append(s.X.values); ys.append(s.Y.values); an.append(s.ANCC.values); wd.extend([wid]*len(s))
+        self.xy = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
+        self.ancc = np.concatenate(an).astype(np.float32); self.wids = np.array(wd)
+        self.scale = np.where(self.xy.std(0) < 1e-3, 1., self.xy.std(0)); self.tree = cKDTree(self.xy/self.scale)
+    def impute(self, xy_q, self_wid=None, k=DENSE_K, nfetch=5000):
+        xy_q = np.atleast_2d(xy_q); q = xy_q/self.scale; nf = min(nfetch, len(self.ancc))
+        dist, idx = self.tree.query(q, k=nf, workers=-1)
+        if self_wid: dist = np.where(self.wids[idx] == self_wid, np.inf, dist)
+        ordr = np.argpartition(dist, min(k-1, nf-1), 1)[:, :k]
+        dk = np.take_along_axis(dist, ordr, 1); ik = np.take_along_axis(idx, ordr, 1)
+        vk = np.isfinite(dk); w = np.where(vk, 1./(dk+1e-3), 0.); sw = w.sum(1); safe = np.where(sw < 1e-9, 1., sw)
+        a = self.ancc[ik]; ap = (a*w).sum(1)/safe; ap = np.where(sw < 1e-9, float(self.ancc.mean()), ap)
+        var = ((a-ap[:,None])**2*w).sum(1)/safe
+        return ap.astype(np.float32), np.sqrt(np.maximum(var, 0.)).astype(np.float32), np.where(vk, dk, np.inf).min(1).astype(np.float32)
+
+_FI = None; _DI = None
+ANCH_OFFS = np.array([-80,-40,-20,-10,-5,0,5,10,20,40,80], np.float32)
+BEAM_OFFS = np.array([-40,-20,-10,-5,-3,0,3,5,10,20,40], np.float32)
+SC_OFFS = np.array([-30,-15,-8,-4,-2,0,2,4,8,15,30], np.float32)
+PF_OFFS = SC_OFFS.copy()
+
+# %% markdown 12: ## 4   Feature table For every eval point we assemble: tracker estimates as deltas from the last-known TVT, tracker agreement / uncertainty, GR statistics & residuals against the typewell at TVT offsets, geometry, and the spatial anchors. T
+
+
+# %% cell 13
+def build_well(hw_path, tw_path, is_train, likpf_map=None):
+    global _FI, _DI
+    wid = Path(hw_path).stem.replace("__horizontal_well", "")
+    try: hw = pd.read_csv(hw_path); tw = pd.read_csv(tw_path).sort_values("TVT")
+    except: return None
+    if is_train and "TVT" not in hw.columns: return None
+    kn = hw[hw.TVT_input.notna()]; ev = hw[hw.TVT_input.isna()]
+    if len(ev) == 0 or len(kn) < 10: return None
+    if is_train and hw.TVT.isna().all(): return None
+    tw_tvt = tw.TVT.to_numpy(np.float32); tw_gr = tw.GR.to_numpy(np.float32)
+    if len(tw_tvt) < 3: return None
+    pf_a, std_a = run_pf_ancc(hw, tw_tvt, tw_gr)
+    if len(pf_a) == 0: return None
+    pf_z, std_z = run_pf_z(hw, tw_tvt, tw_gr)
+    pf_use = pf_a.astype(np.float32); std_use = std_a.astype(np.float32)
+    has_z = len(pf_z) == len(pf_a) and not np.any(np.isnan(pf_z))
+    lk = kn.iloc[-1]; last_tvt = float(lk.TVT_input)
+    gr_full = hw.GR.astype(float).interpolate(limit_direction="both").fillna(float(np.nanmean(tw_gr)))
+    hgr = gr_full.iloc[ev.index[0]:].to_numpy(np.float32); kgr = gr_full.iloc[:len(kn)].to_numpy(np.float32)
+    bpaths = {tag: beam_search(hgr, tw_tvt, tw_gr, last_tvt, bs, mc, es, r) for (bs, mc, es, r, tag) in BEAMS}
+    beam_ref = (bpaths["cons"]+bpaths["sm5"])/2.
+    ktvt = kn.TVT_input.to_numpy(np.float32)
+    sc_res, sc_ens = multi_scale_ncc(kgr, ktvt, hgr, hws=(8, 15, 25), stride=3)
+    sc8, sc8s = sc_res[0]; sc15, sc15s = sc_res[1]; sc25, sc25s = sc_res[2]; sc_cons = (sc8+sc15+sc25)/3.
+    sc_trust = float(np.clip(len(kn)/200., 0., 0.6)); hyb_ref = (1-sc_trust)*beam_ref+sc_trust*sc_ens
+    tw_at_k = np.interp(ktvt, tw_tvt, tw_gr).astype(np.float32); a_cal, b_cal = affine_cal(kgr, tw_at_k)
+    kmd = kn.MD.to_numpy(np.float32); kz = kn.Z.to_numpy(np.float32)
+    pfx_rmse = float(np.sqrt(np.mean((kgr-tw_at_k)**2)))
+    slp_all = robust_slope(kmd, ktvt); slp_50 = robust_slope(kmd[-50:], ktvt[-50:]); slp_z = robust_slope(kz, ktvt)
+    swid = wid if is_train else None
+    xy_ev = ev[["X","Y"]].to_numpy(np.float64); xy_kn = kn[["X","Y"]].to_numpy(np.float64)
+    form_ev, knn_d = _FI.impute(xy_ev, self_wid=swid); form_kn, _ = _FI.impute(xy_kn, self_wid=swid)
+    z_kn = kn.Z.to_numpy(np.float32); z_ev = ev.Z.to_numpy(np.float32)
+    tvt_fs = {}; form_rmse = {}; form_list = []
+    for fi2, fn in enumerate(FORMATIONS):
+        b_full, b_early, b_mid, b_late, b_wls = seg_b_well(ktvt, z_kn, form_kn[:, fi2])
+        tvt_f = (-z_ev+form_ev[:, fi2]+b_full).astype(np.float32)
+        tvt_fs[f"tvtF_{fn}"]=tvt_f; tvt_fs[f"tvtFw_{fn}"]=(-z_ev+form_ev[:,fi2]+b_wls).astype(np.float32)
+        tvt_fs[f"tvtF50_{fn}"]=(-z_ev+form_ev[:,fi2]+b_late).astype(np.float32)
+        tvt_fs[f"bw_{fn}"]=np.float32(b_full); tvt_fs[f"bww_{fn}"]=np.float32(b_wls); tvt_fs[f"bw50_{fn}"]=np.float32(b_late)
+        tvt_fs[f"bw_early_{fn}"]=np.float32(b_early); tvt_fs[f"bw_mid_{fn}"]=np.float32(b_mid)
+        form_rmse[fn]=float(np.sqrt(np.mean((ktvt-(-z_kn+form_kn[:,fi2]+b_full))**2))); form_list.append(tvt_f)
+    fs = np.stack(form_list, 1)
+    form_mean_d=(fs.mean(1)-last_tvt).astype(np.float32); form_std_d=fs.std(1).astype(np.float32); form_rng_d=(fs.max(1)-fs.min(1)).astype(np.float32)
+    d_ancc, d_std, d_dist = _DI.impute(xy_ev, self_wid=swid); d_kn, d_std_kn, _ = _DI.impute(xy_kn, self_wid=swid)
+    _, b_de, b_dm, b_dl, b_dw = seg_b_well(ktvt, z_kn, d_kn); b_d = float(np.median(ktvt+z_kn-d_kn))
+    tvt_dense=(-z_ev+d_ancc+b_d).astype(np.float32); tvt_densew=(-z_ev+d_ancc+b_dw).astype(np.float32); tvt_dense50=(-z_ev+d_ancc+b_dl).astype(np.float32)
+    res_kn = ktvt+z_kn-d_kn; d_rmse=float(np.sqrt(np.mean(res_kn**2))); d_bias=float(np.mean(res_kn)); d_nb_std=float(np.mean(d_std_kn))
+    all_sigs=[pf_use]+list(bpaths.values())+[sc8,sc15,sc25,sc_ens,tvt_fs["tvtF_ANCC"],tvt_dense]
+    sig_mat=np.stack(all_sigs,1); sig_std=sig_mat.std(1).astype(np.float32); sig_mean=(sig_mat.mean(1)-last_tvt).astype(np.float32)
+    gr_s=pd.Series(gr_full.values); rolls={}
+    for w in [5,21,51,101]:
+        r=gr_s.rolling(w,center=True,min_periods=1); rolls[f"grm{w}"]=r.mean().iloc[ev.index].values.astype(np.float32); rolls[f"grs{w}"]=r.std().fillna(0).iloc[ev.index].values.astype(np.float32)
+    for lag in [1,5,15,30]:
+        rolls[f"glag{lag}"]=gr_s.shift(lag).bfill().iloc[ev.index].values.astype(np.float32); rolls[f"glead{lag}"]=gr_s.shift(-lag).ffill().iloc[ev.index].values.astype(np.float32)
+    gr_d1=gr_s.diff().fillna(0.).iloc[ev.index].values.astype(np.float32); gr_d2=gr_s.diff().diff().fillna(0.).iloc[ev.index].values.astype(np.float32)
+    gr_env=gr_s.rolling(21,center=True,min_periods=1).max().iloc[ev.index].values.astype(np.float32)
+    gr_nrg=np.sqrt(np.maximum((gr_s**2).rolling(21,center=True,min_periods=1).mean(),0.)).iloc[ev.index].values.astype(np.float32)
+    hmd=ev.MD.to_numpy(np.float32); md_since=hmd-float(lk.MD)
+    slp_b_all=(last_tvt+slp_all*md_since).astype(np.float32); slp_b_50=(last_tvt+slp_50*md_since).astype(np.float32)
+    mdd=hw.MD.diff().replace(0,np.nan)
+    dzdmd=(hw.Z.diff()/mdd).iloc[ev.index].values.astype(np.float32); dxdmd=(hw.X.diff()/mdd).iloc[ev.index].values.astype(np.float32); dydmd=(hw.Y.diff()/mdd).iloc[ev.index].values.astype(np.float32)
+    nh=len(ev); frac=(np.arange(nh)/max(nh-1,1)).astype(np.float32)
+    def sc(v): return np.full(nh, np.float32(v), np.float32)
+    feats={"well":wid,"id":[f"{wid}_{i}" for i in ev.index],"last_known_tvt":sc(last_tvt),
+        "pf_ancc":pf_use,"pf_ancc_std":std_use,"pf_ancc_delta":(pf_use-last_tvt).astype(np.float32),
+        "pf_z":(pf_z.astype(np.float32) if has_z else sc(last_tvt)),"pf_z_delta":((pf_z-last_tvt).astype(np.float32) if has_z else sc(0.)),
+        "pf_vs_z":((pf_use-pf_z.astype(np.float32)) if has_z else sc(0.)),
+        **{f"beam_{t}_d":(p-np.float32(last_tvt)).astype(np.float32) for t,p in bpaths.items()},
+        "beam_mean_d":np.stack([(p-last_tvt) for p in bpaths.values()],1).mean(1).astype(np.float32),
+        "beam_std_d":np.stack([(p-last_tvt) for p in bpaths.values()],1).std(1).astype(np.float32),
+        "beam_med_d":np.median(np.stack([(p-last_tvt) for p in bpaths.values()],1),1).astype(np.float32),
+        "sc8_d":(sc8-np.float32(last_tvt)).astype(np.float32),"sc8_sc":sc8s,"sc15_d":(sc15-np.float32(last_tvt)).astype(np.float32),"sc15_sc":sc15s,
+        "sc25_d":(sc25-np.float32(last_tvt)).astype(np.float32),"sc25_sc":sc25s,"sc_cons_d":(sc_cons-np.float32(last_tvt)).astype(np.float32),
+        "sc_ens_d":(sc_ens-np.float32(last_tvt)).astype(np.float32),"sc_trust":sc(sc_trust),"hyb_d":(hyb_ref-np.float32(last_tvt)).astype(np.float32),
+        "sig_std":sig_std,"sig_mean_d":sig_mean,**tvt_fs,**{f"frm_rmse_{fn}":sc(form_rmse[fn]) for fn in FORMATIONS},
+        "form_mean_d":form_mean_d,"form_std_d":form_std_d,"form_rng_d":form_rng_d,
+        "spatial_ancc_d":(form_ev[:,0]-np.float32(np.interp(last_tvt,tw_tvt,tw_gr))),"spatial_knn_dist":knn_d,
+        "dense_ancc":d_ancc,"dense_std":d_std,"dense_dist":d_dist,"tvt_dense_d":(tvt_dense-last_tvt).astype(np.float32),
+        "tvt_densew_d":(tvt_densew-last_tvt).astype(np.float32),"tvt_dense50_d":(tvt_dense50-last_tvt).astype(np.float32),
+        "dense_rmse":sc(d_rmse),"dense_bias":sc(d_bias),"dense_nb_std":sc(d_nb_std),
+        "pf_vs_spatial":(pf_use-tvt_fs["tvtF_ANCC"]).astype(np.float32),"pf_vs_dense":(pf_use-tvt_dense).astype(np.float32),
+        "spatial_vs_dense":(tvt_fs["tvtF_ANCC"]-tvt_dense).astype(np.float32),"beam_vs_spatial":(bpaths["cons"]-tvt_fs["tvtF_ANCC"]).astype(np.float32),
+        "sc_vs_beam":(sc_ens-bpaths["cons"]).astype(np.float32),"cal_a":sc(a_cal),"cal_b":sc(b_cal),
+        "pfx_rmse":sc(pfx_rmse),"known_len":sc(len(kn)),"eval_len":sc(nh),"slp_all":sc(slp_all),"slp_50":sc(slp_50),"slp_z":sc(slp_z),
+        "slp_b_d_all":(slp_b_all-last_tvt).astype(np.float32),"slp_b_d_50":(slp_b_50-last_tvt).astype(np.float32),
+        "ktvt_range":sc(float(np.ptp(ktvt))),"ktvt_std":sc(float(ktvt.std())),"md_since":md_since,"frac":frac,"frac2":frac**2,"sqrt_frac":np.sqrt(frac),
+        "z":z_ev,"dx":(ev.X-float(lk.X)).to_numpy(np.float32),"dy":(ev.Y-float(lk.Y)).to_numpy(np.float32),"dz":(z_ev-float(lk.Z)).astype(np.float32),
+        "dxy":np.sqrt((ev.X-float(lk.X))**2+(ev.Y-float(lk.Y))**2).to_numpy(np.float32),"dzdmd":dzdmd,"dxdmd":dxdmd,"dydmd":dydmd,
+        "gr":hgr,"gr_d1":gr_d1,"gr_d2":gr_d2,"gr_env":gr_env,"gr_nrg":gr_nrg,
+        "gr_vs_tw_anc":hgr-np.float32(np.interp(last_tvt,tw_tvt,tw_gr)),"gr_vs_slp_all":hgr-np.interp(slp_b_all,tw_tvt,tw_gr).astype(np.float32),
+        **{f"tda{int(o)}":hgr-np.float32(np.interp(last_tvt+o,tw_tvt,tw_gr)) for o in ANCH_OFFS},
+        **{f"tdbc{int(o)}":hgr-np.interp(beam_ref+o,tw_tvt,tw_gr).astype(np.float32) for o in BEAM_OFFS},
+        **{f"tdsc{int(o)}":hgr-np.interp(sc_ens+o,tw_tvt,tw_gr).astype(np.float32) for o in SC_OFFS},
+        **{f"tdpf{int(o)}":hgr-np.interp(pf_use+o,tw_tvt,tw_gr).astype(np.float32) for o in PF_OFFS},
+        "tw_range":sc(float(np.ptp(tw_tvt))),"tw_gr_mean":sc(float(tw_gr.mean()))}
+    for k,v in rolls.items(): feats[k]=v
+    res = pd.DataFrame(feats)
+    if is_train: res["target"]=(ev.TVT.to_numpy(np.float32)-np.float32(last_tvt))
+    return res
+
+def init_imputers(train_wids):
+    global _FI, _DI
+    _FI = FormationPlaneKNN(train_wids, CFG.DATA/"train"); _DI = DenseANCCImputer(train_wids, CFG.DATA/"train")
+
+def _likpf_rows(wid, split):
+    hw, tw = load_well(wid, split)
+    out, idx, _ = lik_pf(hw, tw)
+    if not len(out): return None
+    d = {"id": [f"{wid}_{i}" for i in idx]}
+    for k, v in out.items():
+        d["likpf_" + k.replace("pf_scale_", "scale_").replace("pf_mean", "mean")] = v.astype(np.float32)
+    return pd.DataFrame(d)
+
+def build_likpf(wids, split):
+    # threads are safe here: the lik-PF numba kernel is compiled with nogil=True, so it
+    # releases the GIL and parallelises across threads (no pickling of numba code needed).
+    res = Parallel(n_jobs=CFG.n_jobs, prefer="threads")(delayed(_likpf_rows)(w, split) for w in wids)
+    return pd.concat([r for r in res if r is not None], ignore_index=True)
+
+def build_features(wids, split, is_train):
+    paths = [CFG.DATA/split/f"{w}__horizontal_well.csv" for w in wids]
+    res = Parallel(n_jobs=CFG.n_jobs, prefer="threads")(
+        delayed(build_well)(str(p), str(p.parent/f"{p.stem.replace('__horizontal_well','')}__typewell.csv"), is_train)
+        for p in paths if (p.parent/f"{p.stem.replace('__horizontal_well','')}__typewell.csv").exists())
+    parts = [r for r in res if r is not None]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+def add_likpf_features(df, likpf):
+    df = df.merge(likpf, on="id", how="left")
+    for c in [c for c in likpf.columns if c != "id"]:
+        df[c] = df[c].fillna(df["last_known_tvt"]); df[c+"_d"] = (df[c]-df["last_known_tvt"]).astype(np.float32)
+    return df
+
+# %% markdown 14: ## 5   Model   a LightGBM/CatBoost stack on GroupKFold(by well) The regression target is `TVT - last_known`. We train several diverse boosters, out-of-fold by well, then blend their OOF with a positive Ridge meta-model.
+
+
+# %% cell 15
+def _device():
+    if CFG.USE_GPU == "cpu": return "cpu", "CPU"
+    if CFG.USE_GPU == "gpu": return "gpu", "GPU"
+    try:  # detect a real NVIDIA GPU (Kaggle GPU accelerator) via nvidia-smi
+        import subprocess
+        if subprocess.run(["nvidia-smi"], capture_output=True).returncode == 0:
+            return "gpu", "GPU"
+    except Exception:
+        pass
+    return "cpu", "CPU"
+
+def lgb_configs(dev):
+    base = dict(boosting_type="gbdt", objective="regression", verbose=-1, n_jobs=-1, max_bin=255)
+    if dev == "gpu": base.update(device_type="gpu", gpu_use_dp=False)
+    n = 600 if CFG.FAST else 5000
+    return [
+        dict(**base, num_leaves=255, min_child_samples=15, subsample=0.8, subsample_freq=1,
+             colsample_bytree=0.8, reg_lambda=3.0, reg_alpha=0.05, learning_rate=0.03, n_estimators=n, seed=123),
+        dict(**base, num_leaves=64, min_child_samples=40, subsample=0.474, subsample_freq=1,
+             colsample_bytree=0.393, reg_lambda=95.75, reg_alpha=10.79, min_child_weight=0.24,
+             learning_rate=0.0093, n_estimators=min(2*n, 10000), random_state=0),
+        dict(**base, num_leaves=64, min_child_samples=40, subsample=0.474, subsample_freq=1,
+             colsample_bytree=0.393, reg_lambda=95.75, reg_alpha=10.79, min_child_weight=0.24,
+             learning_rate=0.0093, n_estimators=min(2*n, 10000), random_state=29),
+    ]
+
+def cb_configs(dev):
+    tt = "GPU" if dev == "gpu" else "CPU"
+    n = 800 if CFG.FAST else 8000
+    return [
+        dict(iterations=n, depth=7, l2_leaf_reg=2.0, min_data_in_leaf=15, border_count=254,
+             loss_function="RMSE", task_type=tt, od_type="Iter", od_wait=300, verbose=0, learning_rate=0.02, random_seed=7),
+        dict(iterations=n, depth=7, l2_leaf_reg=2.0, min_data_in_leaf=15, border_count=254,
+             loss_function="RMSE", task_type=tt, od_type="Iter", od_wait=300, verbose=0, learning_rate=0.03, random_seed=123),
+    ]
+
+def train_stack(train_df, test_df, features):
+    from lightgbm import LGBMRegressor, early_stopping, log_evaluation
+    from catboost import CatBoostRegressor
+    from sklearn.model_selection import GroupKFold
+    from sklearn.linear_model import Ridge
+    dev, devname = _device(); print("device:", devname)
+    X = train_df[features].values.astype(np.float32); y = train_df["target"].values.astype(np.float32)
+    g = train_df["well"].values; Xt = test_df[features].values.astype(np.float32)
+    cv = GroupKFold(CFG.n_splits); oof_cols = {}; test_cols = {}
+    def run(name, make, fit_kw, is_lgb):
+        # LightGBM: slice to best_iteration_ via num_iteration. CatBoost: use_best_model
+        # already trims to the best tree, and its predict() takes no num_iteration kwarg.
+        oof = np.zeros(len(train_df)); tp = np.zeros(len(test_df))
+        for tr, va in cv.split(X, y, groups=g):
+            m = make(); m.fit(X[tr], y[tr], eval_set=[(X[va], y[va])], **fit_kw)
+            if is_lgb:
+                it = m.best_iteration_
+                oof[va] = m.predict(X[va], num_iteration=it); tp += m.predict(Xt, num_iteration=it) / CFG.n_splits
+            else:
+                oof[va] = m.predict(X[va]); tp += m.predict(Xt) / CFG.n_splits
+        oof_cols[name] = oof; test_cols[name] = tp
+        print(f"  {name}: OOF RMSE={rmse(y, oof):.4f}", flush=True)
+    for i, p in enumerate(lgb_configs(dev)):
+        run(f"lgb{i}", lambda p=p: LGBMRegressor(**p),
+            dict(eval_metric="rmse", callbacks=[early_stopping(250, verbose=False), log_evaluation(0)]), True)
+    for i, p in enumerate(cb_configs(dev)):
+        run(f"cb{i}", lambda p=p: CatBoostRegressor(**p),
+            dict(early_stopping_rounds=250, use_best_model=True), False)
+    OOF = pd.DataFrame(oof_cols); TEST = pd.DataFrame(test_cols)
+    rid = Ridge(alpha=1.66, positive=True, fit_intercept=True); meta = np.zeros(len(train_df))
+    for tr, va in cv.split(OOF.values, y, groups=g):
+        rid.fit(OOF.values[tr], y[tr]); meta[va] = rid.predict(OOF.values[va])
+    rid.fit(OOF.values, y); meta_test = rid.predict(TEST.values)
+    print(f"  ridge-stack OOF RMSE={rmse(y, meta):.4f}")
+    return meta, meta_test, OOF, TEST
+
+# %% markdown 16: ## 6   Drift-aware post-processing & blend *(the tuned recipe)* `sub1 =     warmup( )   model_delta` (warm-up damps the first feet after PS where the geology barely moved). `sub2 = lik-PF` (drift-resistant heuristic). The final delta is a b
+
+
+# %% cell 17
+class PP:   # tuned on 773-well GroupKFold OOF (Nelder-Mead + grid; the optimum is flat)
+    alpha = 1.0         # global scale on the learned delta (tuned ~1.0)
+    tau = 85.0          # warm-up length in ft: damps the first feet after PS (tuned ~90)
+    w_pf = 0.0          # blending the model with the single PF no longer helps once lik-PF is a feature
+    w_sub1 = 0.60       # weight on the learned model; lik-PF gets 1-w_sub1. CV optimum ~0.68 (flat
+                        # 0.55-0.68); 0.60 is a small hedge toward the drift-robust lik-PF for LB transfer.
+    sub2_scale = "scale_5"   # which likelihood-scale of the lik-PF to use as sub2 (3/5/8 ~equivalent)
+    sg_win = 61         # per-well Savitzky-Golay smoothing window (effect is small, ~0.01 ft)
+    sg_poly = 3
+
+def warmup(md_since, tau): return 1.-np.exp(-np.maximum(md_since, 0.)/tau) if tau > 1e-6 else 1.0
+
+def make_prediction(df, model_delta, likpf):
+    last = df["last_known_tvt"].values.astype(float)
+    pf_delta = df["pf_ancc"].values.astype(float) - last
+    lp = df[f"likpf_{PP.sub2_scale}"].values.astype(float) - last
+    sub1 = PP.alpha*warmup(df["md_since"].values.astype(float), PP.tau)*(model_delta*(1-PP.w_pf)+pf_delta*PP.w_pf)
+    delta = PP.w_sub1*sub1 + (1-PP.w_sub1)*lp
+    pred = last + delta
+    # per-well Savitzky-Golay smoothing
+    out = pred.copy(); dfx = df.reset_index(drop=True)
+    for _, idx in dfx.groupby("well", sort=False).groups.items():
+        pos = dfx.index.get_indexer(idx); v = pred[pos]; n = len(v); wl = min(PP.sg_win, n)
+        if wl % 2 == 0: wl -= 1
+        if wl >= PP.sg_poly+2: out[pos] = savgol_filter(v, wl, PP.sg_poly)
+    return out
+
+# %% markdown 18: ## 7   Run the full pipeline   submission
+
+
+# %% cell 19
+def _find_models():
+    """Look for a mounted dataset of pre-trained boosters (lgb*.pkl + features.json).
+    If present we run in fast INFERENCE mode; otherwise we train from scratch."""
+    import glob as _g
+    for f in _g.glob("/kaggle/input/**/features.json", recursive=True):
+        d = Path(f).parent
+        if list(d.glob("lgb*.pkl")):
+            return d
+    d = CFG.OUT / "models"
+    return d if (d/"features.json").exists() and list(d.glob("lgb*.pkl")) else None
+
+def main():
+    import json, joblib, glob as _g
+    t0 = time.time()
+    train_wids = sorted(p.stem.replace("__horizontal_well", "") for p in (CFG.DATA/"train").glob("*__horizontal_well.csv"))
+    test_wids = sorted(p.stem.replace("__horizontal_well", "") for p in (CFG.DATA/"test").glob("*__horizontal_well.csv"))
+    if CFG.N_TRAIN_WELLS: train_wids = train_wids[:CFG.N_TRAIN_WELLS]
+    print(f"train wells: {len(train_wids)} | test wells: {len(test_wids)}")
+    init_imputers(train_wids)   # offset-well spatial priors are built from the train wells
+
+    # --- test features are always computed dynamically (works on the hidden test set) ---
+    print("building lik-PF + features (test) ", flush=True)
+    likpf_test = build_likpf(test_wids, "test")
+    test_df = add_likpf_features(build_features(test_wids, "test", is_train=False), likpf_test).reset_index(drop=True)
+
+    models_dir = _find_models()
+    cv_final = None
+    if models_dir is not None:
+        # ---------- fast INFERENCE: load pre-trained boosters ----------
+        print(f"INFERENCE mode   loading models from {models_dir}", flush=True)
+        feats = json.load(open(models_dir/"features.json"))
+        models = [joblib.load(p) for p in sorted(models_dir.glob("lgb*.pkl"))]
+        for c in feats:
+            if c not in test_df.columns: test_df[c] = 0.0
+        Xt = test_df[feats].values.astype(np.float32)
+        meta_test = np.mean([m.predict(Xt) for m in models], axis=0)
+        fallback = float(test_df["last_known_tvt"].mean())
     else:
-        for k, p in enumerate(payloads):
-            wid, pred = pf_worker(p)
-            pf_by_wid[wid] = pred
-    test_t["pf"] = np.nan
-    for wid, pred in pf_by_wid.items():
-        order = test_t.loc[test_t["well_id"].eq(wid)].sort_values("row_idx").index
-        test_t.loc[order, "pf"] = pred
+        # ---------- full TRAIN from scratch (self-contained, reproducible) ----------
+        print("building lik-PF (train) ", flush=True)
+        likpf_train = build_likpf(train_wids, "train")
+        print("building features (train) ", flush=True)
+        train_df = add_likpf_features(build_features(train_wids, "train", is_train=True), likpf_train)
+        feats = [c for c in train_df.columns if c not in {"well", "id", "target"}
+                 and not (c.startswith("likpf_scale_") or c == "likpf_mean") and c in test_df.columns]
+        print(f"features: {len(feats)} | train rows: {len(train_df)} | test rows: {len(test_df)}")
+        meta_oof, meta_test, OOF, TEST = train_stack(train_df, test_df, feats)
+        y = train_df["target"].values.astype(float)
+        cv_final = rmse(train_df["last_known_tvt"].values + y, make_prediction(train_df, meta_oof, None))
+        print(f"\n*** tuned CV pooled-RMSE (TVT) = {cv_final:.4f} ***")
+        fallback = float(train_df["last_known_tvt"].mean() + y.mean())
 
-    # ── blend + smooth ──
-    a = test_t["last_known_TVT"].astype(float).to_numpy()
-    blend = a + BLEND_PF * (test_t["pf"].to_numpy(float) - a) + BLEND_GEOM * (test_t["geom"].to_numpy(float) - a)
-    test_t["blend"] = blend
-    test_t = test_t.sort_values(["well_id", "row_idx"])
-    test_t[PRED_COL] = test_t.groupby("well_id", sort=False)["blend"].transform(
-        lambda x: x.rolling(SMOOTH_W, min_periods=1, center=True).mean())
+    # --- drift-aware blend + submission ---
+    test_pred = make_prediction(test_df, meta_test, None)
+    sub = pd.read_csv(CFG.DATA/"sample_submission.csv")
+    sub["tvt"] = sub["id"].map(dict(zip(test_df["id"], test_pred))).fillna(fallback)
+    sub.to_csv(CFG.OUT/"submission.csv", index=False)
+    print(f"submission.csv written ({len(sub)} rows) in {time.time()-t0:.0f}s")
+    return sub, cv_final
 
-    submission = sample[["id"]].merge(
-        test_t[["id", PRED_COL]].rename(columns={PRED_COL: "tvt"}), on="id", how="left")
-    if submission["tvt"].isna().any():
-        raise ValueError("submission contains missing predictions")
-    submission.to_csv(OUT_PATH, index=False)
-    print(f"wrote {OUT_PATH} rows={len(submission)}  tvt[{submission.tvt.min():.1f},{submission.tvt.max():.1f}]")
+sub, cv_final = main()
+sub.head()
+
+# %% markdown 20: ## 8   Results & what moved the score All numbers below are **pooled GroupKFold-by-well CV RMSE** on the 773 training wells (the metric is RMSE of `TVT - prediction`; the last-known-TVT baseline is 15.91 ft). | Stage | CV RMSE | note | |---
 
 
-if __name__ == "__main__":
-    # --- Phase A2: run exp026, then blend with fork (LB 7.625) kernel output ---
-    main()  # writes OUT_DIR/exp026_submission.csv
+# %% cell 21
+def fig_results():
+    import matplotlib.pyplot as plt
+    names = ["last-known", "LGBM (orig. feats)", "stack + lik-PF feats", "baseline recipe", "ours (final)"]
+    vals = [15.91, 10.85, 9.69, 9.75, cv_final if cv_final else 9.21]
+    colors = ["#bbb", "#7aa", "#5a8", "#caa", "crimson"]
+    fig, ax = plt.subplots(figsize=(9, 4))
+    b = ax.barh(names[::-1], vals[::-1], color=colors[::-1])
+    for r, v in zip(b, vals[::-1]): ax.text(v+0.1, r.get_y()+r.get_height()/2, f"{v:.2f}", va="center")
+    ax.set_xlabel("CV pooled-RMSE (ft, lower is better)"); ax.set_title("Ablation   GroupKFold CV")
+    ax.grid(alpha=.25, axis="x"); plt.tight_layout(); plt.show()
 
-    import shutil as _shutil
-    _work = Path("/kaggle/working") if Path("/kaggle/working").exists() else Path(".")
-    _final = _work / "submission.csv"
+if CFG.SHOW_FIGS:
+    fig_results()
 
-    # fork submission is mounted via kernel_sources at /kaggle/input/<slug>/submission.csv
-    _fork_candidates = [
-        Path("/kaggle/input/rogii-sp45-fleongg-fork/submission.csv"),
-    ] + list(Path("/kaggle/input").rglob("submission.csv")) if Path("/kaggle/input").exists() else []
-    _fork_path = next((p for p in _fork_candidates if p.exists()), None)
 
-    _exp026_path = OUT_DIR / "exp026_submission.csv"
-    _W_FORK, _W_EXP026 = 0.70, 0.30
+# %% cell: final dynamic blend of sp45 projection and fleongg pretrained inference
+from pathlib import Path as _FinalBlendPath
+import numpy as _final_np
+import pandas as _final_pd
+_WORK = _FinalBlendPath('/kaggle/working') if _FinalBlendPath('/kaggle/working').exists() else _FinalBlendPath('.')
+_fle_path = _WORK / 'submission.csv'
+_sp45_path = _WORK / 'sp45_projection_submission.csv'
+_fle = _final_pd.read_csv(_fle_path)
+_fle.to_csv(_WORK / 'fleongg_pretrained_submission.csv', index=False)
+_sp45 = _final_pd.read_csv(_sp45_path)
+if set(_sp45.columns) < {'id', 'tvt'} or set(_fle.columns) < {'id', 'tvt'}:
+    raise RuntimeError('Blend inputs must contain id,tvt columns.')
+_merged = _sp45[['id', 'tvt']].rename(columns={'tvt': 'tvt_sp45'}).merge(
+    _fle[['id', 'tvt']].rename(columns={'tvt': 'tvt_fleongg'}), on='id', how='inner'
+)
+if len(_merged) != len(_sp45) or len(_merged) != len(_fle):
+    raise RuntimeError(f'Blend id mismatch: sp45={len(_sp45)}, fleongg={len(_fle)}, merged={len(_merged)}')
+for _col in ['tvt_sp45', 'tvt_fleongg']:
+    if not _final_np.isfinite(_merged[_col].to_numpy(dtype=float)).all():
+        raise RuntimeError(f'Non-finite values in {_col}')
+_rows = []
+for _w_sp45 in [0.50, 0.52, 0.55, 0.58, 0.60]:
+    _w_fle = 1.0 - _w_sp45
+    _out = _merged[['id']].copy()
+    _out['tvt'] = _w_sp45 * _merged['tvt_sp45'].astype(float) + _w_fle * _merged['tvt_fleongg'].astype(float)
+    _name = f'submission_sp45_fleongg_w{_w_sp45:.2f}.csv'
+    _out.to_csv(_WORK / _name, index=False)
+    _diff = _out['tvt'].to_numpy(dtype=float) - _merged['tvt_sp45'].to_numpy(dtype=float)
+    _rows.append({
+        'file': _name,
+        'w_sp45': _w_sp45,
+        'w_fleongg': _w_fle,
+        'rows': len(_out),
+        'mean_tvt': float(_out['tvt'].mean()),
+        'std_tvt': float(_out['tvt'].std()),
+        'rmse_vs_sp45': float(_final_np.sqrt(_final_np.mean(_diff * _diff))),
+        'p95_abs_vs_sp45': float(_final_np.quantile(_final_np.abs(_diff), 0.95)),
+    })
+_final_name = 'submission_sp45_fleongg_w0.55.csv'
+_final = _final_pd.read_csv(_WORK / _final_name)
+_final.to_csv(_WORK / 'submission.csv', index=False)
+_report = _final_pd.DataFrame(_rows)
+_report.to_csv(_WORK / 'sp45_fleongg_blend_report.csv', index=False)
+print(_report.to_string(index=False), flush=True)
+print('wrote final submission.csv from', _final_name, _final.shape, flush=True)
 
-    if _fork_path is None:
-        # No fork available (e.g. local run): fall back to exp026 alone.
-        print("WARNING: fork submission not found; writing exp026 alone to submission.csv")
-        _shutil.copy2(str(_exp026_path), str(_final))
-    else:
-        print(f"blending fork({_fork_path}) x exp026({_exp026_path}) "
-              f"w={_W_FORK}/{_W_EXP026}")
-        _fork = pd.read_csv(_fork_path).rename(columns={"tvt": "f"})
-        _e = pd.read_csv(_exp026_path).rename(columns={"tvt": "e"})
-        _m = _fork[["id", "f"]].merge(_e[["id", "e"]], on="id", how="outer")
-        _m["tvt"] = _W_FORK * _m["f"] + _W_EXP026 * _m["e"]
-        # fallbacks where one source is missing an id
-        _m.loc[_m["f"].isna(), "tvt"] = _m.loc[_m["f"].isna(), "e"]
-        _m.loc[_m["e"].isna(), "tvt"] = _m.loc[_m["e"].isna(), "f"]
-        if _m["tvt"].isna().any():
-            raise ValueError(f"blend has {_m['tvt'].isna().sum()} NaN")
-        _m[["id", "tvt"]].to_csv(_final, index=False)
-        print(f"wrote {_final} rows={len(_m)} "
-              f"tvt[{_m.tvt.min():.1f},{_m.tvt.max():.1f}] mean={_m.tvt.mean():.2f}")
 
+
+# ============================================================================
+# Phase A2 epilogue: blend fork (above, LB 7.625) with exp026 (PF x geom).
+# exp026 is embedded as base64 and run as a REAL FILE via subprocess so that
+# its multiprocessing PF works and there is NO kernel_sources / external-file
+# dependency -> fully self-contained and rerun-safe (public AND private test).
+# final = 0.70 * fork + 0.30 * exp026   (w from corr 0.611 -> theoretical optimum)
+# ============================================================================
+import base64 as _a2_b64
+import subprocess as _a2_sp
+import sys as _a2_sys
+import shutil as _a2_sh
+import pandas as _a2_pd
+from pathlib import Path as _A2Path
+
+_A2_W_FORK, _A2_W_EXP026 = 0.70, 0.30
+_a2_work = _A2Path("/kaggle/working") if _A2Path("/kaggle/working").exists() else _A2Path(".")
+_a2_fork_final = _a2_work / "submission.csv"          # fork wrote this above
+_a2_fork_saved = _a2_work / "fork_submission.csv"
+
+print("[A2] fork submission produced:", _a2_fork_final, flush=True)
+_a2_sh.copy2(str(_a2_fork_final), str(_a2_fork_saved))
+
+# --- decode + run exp026 as a real file (writes _a2_work/submission.csv) ---
+_A2_EXP026_B64 = "IiIiUk9HSUkgZXhwMDI2IOKAlCBQRiDDlyBnZW9tIHNlbGYtY29udGFpbmVkIGJsZW5kIChLYWdnbGUgTm90ZWJvb2sgc3VibWlzc2lvbikuCgrmnIDntYJiZXN0KOODreODvOOCq+ODqyk9IFBGKEdSLXR5cGV3ZWxs57O75YiX44OI44Op44OD44Kr44O8KSDDlyBnZW9tKOW5vuS9leWkluaMv0xpZ2h0R0JNKSDjga4gTk5MU+ODluODrOODs+ODiSvlubPmu5HjgIIK5pysa2VybmVs44GvIFBGIOOBqCBnZW9tIOOCkiAqKnJhdyBDU1bjgYvjgonoh6rlt7HlrozntZDjgaflho3oqIjnrpcqKuOBl+OBpuaPkOWHuuOBmeOCi+OAggoKQ1YgKGxvY2FsLCBsZWFrLWZyZWUgbmVzdGVkLWZvbGQpOgogIFBGKHR1bmVkKSAxMC45ODQgLyBnZW9tKGV4cDAxNCkgMTMuNTI1IOKGkiAwLjY4MypQRiArIDAuMzkyKmdlb20gKyDlubPmu5EodzEwMSkgPSAxMC4xMDYKCuani+aIkDoKICBnZW9tIDogU0FGRSArIEdyb3VwIEEvQi9DL0QoR1Igcm9sbGluZykgKyBHcm91cCBGKOW5vuS9leWkluaMvykg44KSIExpZ2h0R0JNIGRlbHRh5Zue5biwCiAgICAgICAgICg1LWZvbGQgR3JvdXBLRm9sZC1ieS13ZWxsLCB0ZXN0PTVmb2xk5bmz5Z2HKeOAgmV4cDAxNOebuOW9k+OAggogIFBGICAgOiDlkIR0ZXN0IHdlbGzjgacgdHlwZXdlbGwgR1ItVFZU44OX44Ot44OV44Kh44Kk44Or44Gr5a++44GX54q25oWLIHBvcz1UVlQrWiDjgpLnspLlrZDjg5XjgqPjg6vjgr/ov73ot6EKICAgICAgICAgKGluaXRfc3ByZWFkPTQsIFBOPTAuMDEsIDEyOHNlZWTDlzUwMOeykuWtkCwg5bCk5bqm5Yqg6YeNKeOAgnR1bmVkIGNvbmZpZ+OAggogIGJsZW5kOiBhbmNob3IgKyAwLjY4MyooUEYtYW5jaG9yKSArIDAuMzkyKihnZW9tLWFuY2hvcikg4oaSIHdlbGzlhoUgcm936aCGIG1lYW7lubPmu5Eodz0xMDEp44CCCgpsZWFrLWZyZWU6IGhpZGRlbiBUVlTkuI3kvb/nlKjjgIJHUi90eXBld2VsbC9hbmNob3Iv5pei55+l5bm+5L2VKFgvWS9aL01EKeOBruOBv+OAggoiIiIKZnJvbSBwYXRobGliIGltcG9ydCBQYXRoCmltcG9ydCByZQppbXBvcnQgb3MKZnJvbSBjb25jdXJyZW50LmZ1dHVyZXMgaW1wb3J0IFByb2Nlc3NQb29sRXhlY3V0b3IKCmltcG9ydCBsaWdodGdibSBhcyBsZ2IKaW1wb3J0IG51bXB5IGFzIG5wCmltcG9ydCBwYW5kYXMgYXMgcGQKClBGX1dPUktFUlMgPSBtYXgoMSwgbWluKDQsIChvcy5jcHVfY291bnQoKSBvciAyKSAtIDEpKSAgIyBLYWdnbGUgQ1BVIH40IGNvcmVzCgojIOKUgOKUgCBsb2NhdGlvbnMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBmaW5kX2lucHV0X2RpcigpIC0+IFBhdGg6CiAgICBmb3Igcm9vdCBpbiAoUGF0aCgiL2thZ2dsZS9pbnB1dCIpLCBQYXRoKCJkYXRhL3JhdyIpLCBQYXRoKCJkYXRhIikpOgogICAgICAgIGlmIHJvb3QuZXhpc3RzKCk6CiAgICAgICAgICAgIGhpdHMgPSBsaXN0KHJvb3Qucmdsb2IoInNhbXBsZV9zdWJtaXNzaW9uLmNzdiIpKQogICAgICAgICAgICBpZiBoaXRzOgogICAgICAgICAgICAgICAgcmV0dXJuIGhpdHNbMF0ucGFyZW50CiAgICByYWlzZSBGaWxlTm90Rm91bmRFcnJvcigic2FtcGxlX3N1Ym1pc3Npb24uY3N2IG5vdCBmb3VuZCIpCgoKSU5QVVRfRElSID0gZmluZF9pbnB1dF9kaXIoKQpUUkFJTl9ESVIgPSBJTlBVVF9ESVIgLyAidHJhaW4iClRFU1RfRElSID0gSU5QVVRfRElSIC8gInRlc3QiClNBTVBMRV9TVUJfUEFUSCA9IElOUFVUX0RJUiAvICJzYW1wbGVfc3VibWlzc2lvbi5jc3YiCk9VVF9ESVIgPSBQYXRoKCIva2FnZ2xlL3dvcmtpbmciKSBpZiBQYXRoKCIva2FnZ2xlL3dvcmtpbmciKS5leGlzdHMoKSBlbHNlIFBhdGgoIi4iKQpPVVRfUEFUSCA9IE9VVF9ESVIgLyAic3VibWlzc2lvbi5jc3YiCgpQUkVEX0NPTCA9ICJwcmVkX3R2dCIKTl9TUExJVFMgPSA1CgojIGJsZW5kIChmcm9tIGxvY2FsIDItd2F5IE5OTFMgb24gbGVhay1mcmVlIE9PRikgKyBzbW9vdGhpbmcKQkxFTkRfUEYgPSAwLjY4MwpCTEVORF9HRU9NID0gMC4zOTIKU01PT1RIX1cgPSAxMDEKCiMgUEYgdHVuZWQgY29uZmlnClBGX1NFRURTID0gMTI4ClBGX1BBUlRJQ0xFUyA9IDUwMApQRl9TQ0FMRSA9IDguMApQRl9JTklUX1NQUkVBRCA9IDQuMApQRl9QTiA9IDAuMDEKUEZfVk4gPSAwLjAwMgpQRl9NT00gPSAwLjk5OApQRl9SUCA9IDAuMQpQRl9SUiA9IDAuMDAxClBGX1JFU0FNUCA9IDAuNQoKU0FGRV9GRUFUVVJFUyA9IFsKICAgICJNRCIsICJYIiwgIlkiLCAiWiIsICJHUiIsICJpc19ncl9taXNzaW5nIiwgIm5fcm93c19pbl93ZWxsIiwKICAgICJrbm93bl9sZW5ndGgiLCAiaGlkZGVuX2xlbmd0aCIsICJsYXN0X2tub3duX1RWVCIsICJsYXN0X2tub3duX01EIiwKICAgICJsYXN0X2tub3duX1giLCAibGFzdF9rbm93bl9ZIiwgImxhc3Rfa25vd25fWiIsICJkZWx0YV9NRF9mcm9tX1BTIiwKICAgICJkZWx0YV9YX2Zyb21fUFMiLCAiZGVsdGFfWV9mcm9tX1BTIiwgImRlbHRhX1pfZnJvbV9QUyIsCiAgICAicG9zdF9wc19zdGVwIiwgInJvd19mcmFjIiwKXQpHUk9VUF9BID0gWyJwcmVfcHNfdHZ0X3Nsb3BlX2xhc3QyMCIsICJwcmVfcHNfdHZ0X3Nsb3BlX2xhc3Q1IiwKICAgICAgICAgICAicHJlX3BzX3R2dF9jdXJ2YXR1cmUiLCAicHJlX3BzX3R2dF9kZWx0YV9sYXN0MjAiXQpHUk9VUF9CX1dFTEwgPSBbInByZV9wc19kWl9kTUQiLCAicHJlX3BzX2RYX2RNRCIsICJwcmVfcHNfZFlfZE1EIiwKICAgICAgICAgICAgICAgICJwcmVfcHNfaG9yaXpfZE1EIiwgInByZV9wc19hemltdXRoIl0KR1JPVVBfQl9ST1cgPSBbImRaX2RNRF9mcm9tX3BzIiwgImRYX2RNRF9mcm9tX3BzIiwgImRZX2RNRF9mcm9tX3BzIiwKICAgICAgICAgICAgICAgImhvcml6X2Rpc3BfZnJvbV9wcyIsICJhemltdXRoX2Zyb21fcHMiXQpHUk9VUF9DID0gWyJraF9yYXRpbyIsICJoaWRkZW5fZnJhYyJdCkdST1VQX0RfV0VMTCA9IFsicHJlX3BzX2dyX21lYW4iLCAicHJlX3BzX2dyX3N0ZCIsICJwcmVfcHNfZ3JfbGFzdDIwX21lYW4iLAogICAgICAgICAgICAgICAgInByZV9wc19ncl90cmVuZCIsICJwcmVfcHNfZ3JfYXZhaWxhYmxlX2ZyYWMiXQpHUk9VUF9EX1JPVyA9IFsiZ3JfdnNfcHJlX3BzX21lYW4iLCAiZ3Jfel9zY29yZSIsICJncl9yb2xsaW5nX21lYW5fdzIwIiwKICAgICAgICAgICAgICAgImdyX3JvbGxpbmdfbWVhbl93NTAiLCAiZ3Jfcm9sbGluZ19zdGRfdzIwIl0KR1JPVVBfRl9XRUxMID0gWyJmX2R0dnRfZG1kX2w1MCIsICJmX2R0dnRfZHpfcHJlIiwgImZfZHR2dF9kel9yMiJdCkdST1VQX0ZfUk9XID0gWyJmX2V4dHJhcF9zbG9wZTIwX2RNRCIsICJmX2V4dHJhcF9zbG9wZTVfZE1EIiwgImZfZXh0cmFwX3F1YWRfZE1EIiwKICAgICAgICAgICAgICAgImZfZXh0cmFwX3oiLCAiZl9leHRyYXBfZGlzYWdyZWUiXQpBTExfRkVBVFVSRVMgPSAoU0FGRV9GRUFUVVJFUyArIEdST1VQX0EgKyBHUk9VUF9CX1dFTEwgKyBHUk9VUF9CX1JPVwogICAgICAgICAgICAgICAgKyBHUk9VUF9DICsgR1JPVVBfRF9XRUxMICsgR1JPVVBfRF9ST1cgKyBHUk9VUF9GX1dFTEwgKyBHUk9VUF9GX1JPVykKCgojIOKUgOKUgCBiYXNlIGZlYXR1cmUgcmVjb25zdHJ1Y3Rpb24gKHJlcGxpY2F0ZXMgc3JjL3JvZ2lpL2RhdGEvYnVpbGRfYmFzZS5weSkg4pSA4pSA4pSA4pSA4pSACmRlZiB3ZWxsX2lkX2Zyb21fcGF0aChwYXRoOiBQYXRoKSAtPiBzdHI6CiAgICByZXR1cm4gcGF0aC5uYW1lLnNwbGl0KCJfXyIsIDEpWzBdCgoKZGVmIG5hdHVyYWxfa2V5KHBhdGg6IFBhdGgpOgogICAgcmV0dXJuIFtpbnQoeCkgaWYgeC5pc2RpZ2l0KCkgZWxzZSB4IGZvciB4IGluIHJlLnNwbGl0KHIiKFxkKykiLCBwYXRoLm5hbWUpXQoKCmRlZiBidWlsZF9iYXNlX2Zvcl9maWxlKHBhdGg6IFBhdGgsIHNwbGl0OiBzdHIpIC0+IHBkLkRhdGFGcmFtZToKICAgIHJhdyA9IHBkLnJlYWRfY3N2KHBhdGgpCiAgICB3ZWxsX2lkID0gd2VsbF9pZF9mcm9tX3BhdGgocGF0aCkKICAgIGRmID0gcGQuRGF0YUZyYW1lKGluZGV4PXJhdy5pbmRleCkKICAgIGRmWyJzcGxpdCJdID0gc3BsaXQKICAgIGRmWyJ3ZWxsX2lkIl0gPSB3ZWxsX2lkCiAgICBkZlsicm93X2lkeCJdID0gcmF3LmluZGV4LmFzdHlwZSgiaW50NjQiKQogICAgZm9yIGNvbCBpbiBbIk1EIiwgIlgiLCAiWSIsICJaIiwgIkdSIiwgIlRWVF9pbnB1dCIsICJUVlQiXToKICAgICAgICBkZltjb2xdID0gcmF3W2NvbF0gaWYgY29sIGluIHJhdy5jb2x1bW5zIGVsc2UgcGQuTkEKICAgIGRmWyJUVlQiXSA9IHBkLnRvX251bWVyaWMoZGZbIlRWVCJdLCBlcnJvcnM9ImNvZXJjZSIpCiAgICBkZlsiVFZUX2lucHV0Il0gPSBwZC50b19udW1lcmljKGRmWyJUVlRfaW5wdXQiXSwgZXJyb3JzPSJjb2VyY2UiKQoKICAgIG1pc3NpbmcgPSBkZlsiVFZUX2lucHV0Il0uaXNuYSgpCiAgICBwc19pZHggPSBpbnQobWlzc2luZy5pZHhtYXgoKSkgaWYgbWlzc2luZy5hbnkoKSBlbHNlIGxlbihkZikKICAgIG5fcm93cyA9IGxlbihkZikKICAgIGtub3duX2xlbmd0aCA9IHBzX2lkeCBpZiBtaXNzaW5nLmFueSgpIGVsc2Ugbl9yb3dzCiAgICBoaWRkZW5fbGVuZ3RoID0gbl9yb3dzIC0ga25vd25fbGVuZ3RoCiAgICBpc190YXJnZXQgPSAoZGZbInJvd19pZHgiXSA+PSBwc19pZHgpIGlmIG1pc3NpbmcuYW55KCkgZWxzZSBwZC5TZXJpZXMoRmFsc2UsIGluZGV4PWRmLmluZGV4KQoKICAgIGFuY2hvcl9pZHggPSBtYXgoa25vd25fbGVuZ3RoIC0gMSwgMCkKICAgIGFuY2hvciA9IGRmLmxvY1thbmNob3JfaWR4LCBbIk1EIiwgIlgiLCAiWSIsICJaIiwgIlRWVF9pbnB1dCJdXQoKICAgIGRmWyJpZCJdID0gcGQuTkEKICAgIGlmIHNwbGl0ID09ICJ0ZXN0IjoKICAgICAgICBkZi5sb2NbaXNfdGFyZ2V0LCAiaWQiXSA9IGRmLmxvY1tpc190YXJnZXQsICJyb3dfaWR4Il0ubWFwKGxhbWJkYSByOiBmInt3ZWxsX2lkfV97cn0iKQogICAgZGZbImlzX3RhcmdldCJdID0gaXNfdGFyZ2V0LmFzdHlwZShib29sKQogICAgZGZbImlzX2tub3duX3R2dCJdID0gZGZbIlRWVF9pbnB1dCJdLm5vdG5hKCkKICAgIGRmWyJpc19ncl9taXNzaW5nIl0gPSBkZlsiR1IiXS5pc25hKCkKICAgIGRmWyJuX3Jvd3NfaW5fd2VsbCJdID0gaW50KG5fcm93cykKICAgIGRmWyJrbm93bl9sZW5ndGgiXSA9IGludChrbm93bl9sZW5ndGgpCiAgICBkZlsiaGlkZGVuX2xlbmd0aCJdID0gaW50KGhpZGRlbl9sZW5ndGgpCiAgICBkZlsibGFzdF9rbm93bl9UVlQiXSA9IGFuY2hvclsiVFZUX2lucHV0Il0KICAgIGRmWyJsYXN0X2tub3duX01EIl0gPSBhbmNob3JbIk1EIl0KICAgIGRmWyJsYXN0X2tub3duX1giXSA9IGFuY2hvclsiWCJdCiAgICBkZlsibGFzdF9rbm93bl9ZIl0gPSBhbmNob3JbIlkiXQogICAgZGZbImxhc3Rfa25vd25fWiJdID0gYW5jaG9yWyJaIl0KICAgIGRmWyJkZWx0YV9NRF9mcm9tX1BTIl0gPSBkZlsiTUQiXSAtIGFuY2hvclsiTUQiXQogICAgZGZbImRlbHRhX1hfZnJvbV9QUyJdID0gZGZbIlgiXSAtIGFuY2hvclsiWCJdCiAgICBkZlsiZGVsdGFfWV9mcm9tX1BTIl0gPSBkZlsiWSJdIC0gYW5jaG9yWyJZIl0KICAgIGRmWyJkZWx0YV9aX2Zyb21fUFMiXSA9IGRmWyJaIl0gLSBhbmNob3JbIloiXQogICAgZGZbInBvc3RfcHNfc3RlcCJdID0gKGRmWyJyb3dfaWR4Il0gLSBwc19pZHgpLmNsaXAobG93ZXI9MCkKICAgIGRmWyJyb3dfZnJhYyJdID0gZGZbInJvd19pZHgiXSAvIG1heChuX3Jvd3MgLSAxLCAxKQogICAgcmV0dXJuIGRmCgoKZGVmIGxvYWRfYmFzZShzcGxpdF9kaXI6IFBhdGgsIHNwbGl0OiBzdHIpIC0+IHBkLkRhdGFGcmFtZToKICAgIHBhdGhzID0gc29ydGVkKHNwbGl0X2Rpci5nbG9iKCIqX19ob3Jpem9udGFsX3dlbGwuY3N2IiksIGtleT1uYXR1cmFsX2tleSkKICAgIHJldHVybiBwZC5jb25jYXQoW2J1aWxkX2Jhc2VfZm9yX2ZpbGUocCwgc3BsaXQpIGZvciBwIGluIHBhdGhzXSwgaWdub3JlX2luZGV4PVRydWUpCgoKIyDilIDilIAgR3JvdXAgQS9CL0Mg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiB0cmFqX3Blcl93ZWxsKGRmOiBwZC5EYXRhRnJhbWUpIC0+IHBkLkRhdGFGcmFtZToKICAgIGtub3duID0gZGZbZGZbImlzX2tub3duX3R2dCJdLmFzdHlwZShib29sKV0KICAgIHJlY3MgPSBbXQogICAgZm9yIHdpZCwgZyBpbiBrbm93bi5ncm91cGJ5KCJ3ZWxsX2lkIiwgc29ydD1GYWxzZSk6CiAgICAgICAgZyA9IGcuc29ydF92YWx1ZXMoInJvd19pZHgiKQogICAgICAgIG1kID0gZ1siTUQiXS50b19udW1weShmbG9hdCk7IHggPSBnWyJYIl0udG9fbnVtcHkoZmxvYXQpCiAgICAgICAgeSA9IGdbIlkiXS50b19udW1weShmbG9hdCk7IHogPSBnWyJaIl0udG9fbnVtcHkoZmxvYXQpCiAgICAgICAgdHYgPSBnWyJUVlRfaW5wdXQiXS50b19udW1weShmbG9hdCk7IG4gPSBsZW4oZykKICAgICAgICBuMjAgPSBtaW4oMjAsIG4pOyBuNSA9IG1pbig1LCBuKQogICAgICAgIGQyMCA9IG1kWy0xXSAtIG1kWy1uMjBdIGlmIG4yMCA+IDEgZWxzZSAxLgogICAgICAgIGQ1ID0gbWRbLTFdIC0gbWRbLW41XSBpZiBuNSA+IDEgZWxzZSAxLgogICAgICAgIHMyMCA9ICh0dlstMV0gLSB0dlstbjIwXSkgLyBkMjAgaWYgYWJzKGQyMCkgPiAxZS02IGVsc2UgMC4KICAgICAgICBzNSA9ICh0dlstMV0gLSB0dlstbjVdKSAvIGQ1IGlmIGFicyhkNSkgPiAxZS02IGVsc2UgMC4KICAgICAgICBkeiA9ICh6Wy0xXSAtIHpbLW4yMF0pIC8gZDIwIGlmIGFicyhkMjApID4gMWUtNiBlbHNlIDAuCiAgICAgICAgZHggPSAoeFstMV0gLSB4Wy1uMjBdKSAvIGQyMCBpZiBhYnMoZDIwKSA+IDFlLTYgZWxzZSAwLgogICAgICAgIGR5ID0gKHlbLTFdIC0geVstbjIwXSkgLyBkMjAgaWYgYWJzKGQyMCkgPiAxZS02IGVsc2UgMC4KICAgICAgICBkeDIwID0geFstMV0gLSB4Wy1uMjBdOyBkeTIwID0geVstMV0gLSB5Wy1uMjBdCiAgICAgICAgaGQgPSBmbG9hdChucC5zcXJ0KGR4MjAgKiogMiArIGR5MjAgKiogMikpCiAgICAgICAgcmVjcy5hcHBlbmQoeyJ3ZWxsX2lkIjogd2lkLAogICAgICAgICAgICAgICAgICAgICAicHJlX3BzX3R2dF9zbG9wZV9sYXN0MjAiOiBzMjAsICJwcmVfcHNfdHZ0X3Nsb3BlX2xhc3Q1IjogczUsCiAgICAgICAgICAgICAgICAgICAgICJwcmVfcHNfdHZ0X2N1cnZhdHVyZSI6IHM1IC0gczIwLCAicHJlX3BzX3R2dF9kZWx0YV9sYXN0MjAiOiB0dlstMV0gLSB0dlstbjIwXSwKICAgICAgICAgICAgICAgICAgICAgInByZV9wc19kWl9kTUQiOiBkeiwgInByZV9wc19kWF9kTUQiOiBkeCwgInByZV9wc19kWV9kTUQiOiBkeSwKICAgICAgICAgICAgICAgICAgICAgInByZV9wc19ob3Jpel9kTUQiOiBoZCAvIGQyMCBpZiBhYnMoZDIwKSA+IDFlLTYgZWxzZSAwLiwKICAgICAgICAgICAgICAgICAgICAgInByZV9wc19hemltdXRoIjogZmxvYXQobnAuYXJjdGFuMihkeTIwLCBkeDIwKSl9KQogICAgcmV0dXJuIHBkLkRhdGFGcmFtZShyZWNzKQoKCmRlZiB0cmFqX3Blcl9yb3coZGY6IHBkLkRhdGFGcmFtZSkgLT4gcGQuRGF0YUZyYW1lOgogICAgZGYgPSBkZi5jb3B5KCkKICAgIG1zID0gbnAud2hlcmUoZGZbImRlbHRhX01EX2Zyb21fUFMiXS50b19udW1weShmbG9hdCkgPCAxLiwgMS4sIGRmWyJkZWx0YV9NRF9mcm9tX1BTIl0udG9fbnVtcHkoZmxvYXQpKQogICAgZGZbImRaX2RNRF9mcm9tX3BzIl0gPSBkZlsiZGVsdGFfWl9mcm9tX1BTIl0uYXN0eXBlKGZsb2F0KSAvIG1zCiAgICBkZlsiZFhfZE1EX2Zyb21fcHMiXSA9IGRmWyJkZWx0YV9YX2Zyb21fUFMiXS5hc3R5cGUoZmxvYXQpIC8gbXMKICAgIGRmWyJkWV9kTURfZnJvbV9wcyJdID0gZGZbImRlbHRhX1lfZnJvbV9QUyJdLmFzdHlwZShmbG9hdCkgLyBtcwogICAgZGZbImhvcml6X2Rpc3BfZnJvbV9wcyJdID0gbnAuc3FydChkZlsiZGVsdGFfWF9mcm9tX1BTIl0uYXN0eXBlKGZsb2F0KSAqKiAyCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICsgZGZbImRlbHRhX1lfZnJvbV9QUyJdLmFzdHlwZShmbG9hdCkgKiogMikKICAgIGRmWyJhemltdXRoX2Zyb21fcHMiXSA9IG5wLmFyY3RhbjIoZGZbImRlbHRhX1lfZnJvbV9QUyJdLmFzdHlwZShmbG9hdCksCiAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIGRmWyJkZWx0YV9YX2Zyb21fUFMiXS5hc3R5cGUoZmxvYXQpKQogICAgaGwgPSBkZlsiaGlkZGVuX2xlbmd0aCJdLnRvX251bXB5KGZsb2F0KQogICAgZGZbImtoX3JhdGlvIl0gPSBkZlsia25vd25fbGVuZ3RoIl0uYXN0eXBlKGZsb2F0KSAvIG5wLndoZXJlKGhsIDwgMS4sIDEuLCBobCkKICAgIGRmWyJoaWRkZW5fZnJhYyJdID0gaGwgLyBkZlsibl9yb3dzX2luX3dlbGwiXS5hc3R5cGUoZmxvYXQpCiAgICByZXR1cm4gZGYKCgojIOKUgOKUgCBHcm91cCBEIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgZ3JfcGVyX3dlbGwoZGY6IHBkLkRhdGFGcmFtZSwgZ2xvYmFsX2dyX21lYW46IGZsb2F0KSAtPiBwZC5EYXRhRnJhbWU6CiAgICBrbm93biA9IGRmW2RmWyJpc19rbm93bl90dnQiXS5hc3R5cGUoYm9vbCldCiAgICByZWNzID0gW10KICAgIGZvciB3aWQsIGcgaW4ga25vd24uZ3JvdXBieSgid2VsbF9pZCIsIHNvcnQ9RmFsc2UpOgogICAgICAgIGcgPSBnLnNvcnRfdmFsdWVzKCJyb3dfaWR4IikKICAgICAgICBnciA9IGdbIkdSIl0udG9fbnVtcHkoZmxvYXQpOyBtZCA9IGdbIk1EIl0udG9fbnVtcHkoZmxvYXQpCiAgICAgICAgdmFsaWQgPSB+bnAuaXNuYW4oZ3IpOyBudiA9IGludCh2YWxpZC5zdW0oKSk7IG50ID0gbGVuKGdyKQogICAgICAgIGlmIG52ID09IDA6CiAgICAgICAgICAgIHJlY3MuYXBwZW5kKHsid2VsbF9pZCI6IHdpZCwgInByZV9wc19ncl9tZWFuIjogZ2xvYmFsX2dyX21lYW4sCiAgICAgICAgICAgICAgICAgICAgICAgICAicHJlX3BzX2dyX3N0ZCI6IDAuLCAicHJlX3BzX2dyX2xhc3QyMF9tZWFuIjogZ2xvYmFsX2dyX21lYW4sCiAgICAgICAgICAgICAgICAgICAgICAgICAicHJlX3BzX2dyX3RyZW5kIjogMC4sICJwcmVfcHNfZ3JfYXZhaWxhYmxlX2ZyYWMiOiAwLn0pOyBjb250aW51ZQogICAgICAgIGd2ID0gZ3JbdmFsaWRdOyBtdiA9IG1kW3ZhbGlkXTsgbTIwID0gbWluKDIwLCBsZW4oZ3YpKTsgZF9tZCA9IG12Wy0xXSAtIG12WzBdCiAgICAgICAgcmVjcy5hcHBlbmQoeyJ3ZWxsX2lkIjogd2lkLAogICAgICAgICAgICAgICAgICAgICAicHJlX3BzX2dyX21lYW4iOiBmbG9hdChucC5uYW5tZWFuKGdyKSksCiAgICAgICAgICAgICAgICAgICAgICJwcmVfcHNfZ3Jfc3RkIjogZmxvYXQobnAubmFuc3RkKGdyKSksCiAgICAgICAgICAgICAgICAgICAgICJwcmVfcHNfZ3JfbGFzdDIwX21lYW4iOiBmbG9hdChndlstbTIwOl0ubWVhbigpKSwKICAgICAgICAgICAgICAgICAgICAgInByZV9wc19ncl90cmVuZCI6IChndlstMV0gLSBndlswXSkgLyBkX21kIGlmIGFicyhkX21kKSA+IDFlLTYgZWxzZSAwLiwKICAgICAgICAgICAgICAgICAgICAgInByZV9wc19ncl9hdmFpbGFibGVfZnJhYyI6IG52IC8gbnR9KQogICAgcmV0dXJuIHBkLkRhdGFGcmFtZShyZWNzKQoKCmRlZiBncl9wZXJfcm93KGRmOiBwZC5EYXRhRnJhbWUsIGdsb2JhbF9ncl9tZWFuOiBmbG9hdCkgLT4gcGQuRGF0YUZyYW1lOgogICAgZGYgPSBkZi5zb3J0X3ZhbHVlcyhbIndlbGxfaWQiLCAicm93X2lkeCJdKS5jb3B5KCkKICAgIGdyX2YgPSBkZlsiR1IiXS5jb3B5KCkuYXN0eXBlKGZsb2F0KQogICAgZ3JfZltncl9mLmlzbmEoKV0gPSBkZi5sb2NbZ3JfZi5pc25hKCksICJwcmVfcHNfZ3JfbWVhbiJdLmZpbGxuYShnbG9iYWxfZ3JfbWVhbikKICAgIHN0ZF9zID0gZGZbInByZV9wc19ncl9zdGQiXS5maWxsbmEoMS4pLnJlcGxhY2UoMC4sIDEuKQogICAgZGZbImdyX3ZzX3ByZV9wc19tZWFuIl0gPSBncl9mIC0gZGZbInByZV9wc19ncl9tZWFuIl0uZmlsbG5hKGdsb2JhbF9ncl9tZWFuKQogICAgZGZbImdyX3pfc2NvcmUiXSA9IGRmWyJncl92c19wcmVfcHNfbWVhbiJdIC8gc3RkX3MKICAgIGRmWyJfZ3JfZiJdID0gZ3JfZgogICAgZm9yIHcsIGMgaW4gWygyMCwgImdyX3JvbGxpbmdfbWVhbl93MjAiKSwgKDUwLCAiZ3Jfcm9sbGluZ19tZWFuX3c1MCIpXToKICAgICAgICBkZltjXSA9IGRmLmdyb3VwYnkoIndlbGxfaWQiLCBzb3J0PUZhbHNlKVsiX2dyX2YiXS50cmFuc2Zvcm0oCiAgICAgICAgICAgIGxhbWJkYSB4OiB4LnJvbGxpbmcodywgbWluX3BlcmlvZHM9MSkubWVhbigpKQogICAgZGZbImdyX3JvbGxpbmdfc3RkX3cyMCJdID0gZGYuZ3JvdXBieSgid2VsbF9pZCIsIHNvcnQ9RmFsc2UpWyJfZ3JfZiJdLnRyYW5zZm9ybSgKICAgICAgICBsYW1iZGEgeDogeC5yb2xsaW5nKDIwLCBtaW5fcGVyaW9kcz0yKS5zdGQoKS5maWxsbmEoMC4pKQogICAgcmV0dXJuIGRmLmRyb3AoY29sdW1ucz1bIl9ncl9mIl0pCgoKIyDilIDilIAgR3JvdXAgRiBnZW9tZXRyaWMgZXh0cmFwb2xhdGlvbiAoZnJvbSBleHAwMTQpIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgZ2VvbV9wZXJfd2VsbChkZjogcGQuRGF0YUZyYW1lKSAtPiBwZC5EYXRhRnJhbWU6CiAgICBrbm93biA9IGRmW2RmWyJpc19rbm93bl90dnQiXS5hc3R5cGUoYm9vbCldCiAgICByZWNzID0gW10KICAgIGZvciB3aWQsIGcgaW4ga25vd24uZ3JvdXBieSgid2VsbF9pZCIsIHNvcnQ9RmFsc2UpOgogICAgICAgIGcgPSBnLnNvcnRfdmFsdWVzKCJyb3dfaWR4IikKICAgICAgICBtZCA9IGdbIk1EIl0udG9fbnVtcHkoZmxvYXQpOyB6ID0gZ1siWiJdLnRvX251bXB5KGZsb2F0KQogICAgICAgIHR2ID0gZ1siVFZUX2lucHV0Il0udG9fbnVtcHkoZmxvYXQpOyBuID0gbGVuKGcpCiAgICAgICAgbjUwID0gbWluKDUwLCBuKQogICAgICAgIGlmIG41MCA+PSAyIGFuZCBhYnMobWRbLTFdIC0gbWRbLW41MF0pID4gMWUtNjoKICAgICAgICAgICAgZHR2dF9kbWRfbDUwID0gZmxvYXQobnAucG9seWZpdChtZFstbjUwOl0sIHR2Wy1uNTA6XSwgMSlbMF0pCiAgICAgICAgZWxzZToKICAgICAgICAgICAgZHR2dF9kbWRfbDUwID0gMC4wCiAgICAgICAgaWYgbiA+PSAzIGFuZCBucC5wdHAoeikgPiAxZS0zOgogICAgICAgICAgICB6YyA9IHogLSB6Lm1lYW4oKQogICAgICAgICAgICBkZW5vbSA9IGZsb2F0KG5wLmRvdCh6YywgemMpKQogICAgICAgICAgICBzbG9wZV96ID0gZmxvYXQobnAuZG90KHpjLCB0diAtIHR2Lm1lYW4oKSkgLyBkZW5vbSkgaWYgZGVub20gPiAxZS05IGVsc2UgMC4wCiAgICAgICAgICAgIHByZWQgPSBzbG9wZV96ICogemMgKyB0di5tZWFuKCkKICAgICAgICAgICAgc3NfcmVzID0gZmxvYXQobnAuc3VtKCh0diAtIHByZWQpICoqIDIpKTsgc3NfdG90ID0gZmxvYXQobnAuc3VtKCh0diAtIHR2Lm1lYW4oKSkgKiogMikpCiAgICAgICAgICAgIHIyID0gMS4wIC0gc3NfcmVzIC8gc3NfdG90IGlmIHNzX3RvdCA+IDFlLTkgZWxzZSAwLjAKICAgICAgICBlbHNlOgogICAgICAgICAgICBzbG9wZV96ID0gMC4wOyByMiA9IDAuMAogICAgICAgIHJlY3MuYXBwZW5kKHsid2VsbF9pZCI6IHdpZCwgImZfZHR2dF9kbWRfbDUwIjogZHR2dF9kbWRfbDUwLAogICAgICAgICAgICAgICAgICAgICAiZl9kdHZ0X2R6X3ByZSI6IHNsb3BlX3osICJmX2R0dnRfZHpfcjIiOiByMn0pCiAgICByZXR1cm4gcGQuRGF0YUZyYW1lKHJlY3MpCgoKZGVmIGdlb21fcGVyX3JvdyhkZjogcGQuRGF0YUZyYW1lKSAtPiBwZC5EYXRhRnJhbWU6CiAgICBkZiA9IGRmLmNvcHkoKQogICAgZG1kID0gZGZbImRlbHRhX01EX2Zyb21fUFMiXS5hc3R5cGUoZmxvYXQpOyBkeiA9IGRmWyJkZWx0YV9aX2Zyb21fUFMiXS5hc3R5cGUoZmxvYXQpCiAgICBzMjAgPSBkZlsicHJlX3BzX3R2dF9zbG9wZV9sYXN0MjAiXS5hc3R5cGUoZmxvYXQpOyBzNSA9IGRmWyJwcmVfcHNfdHZ0X3Nsb3BlX2xhc3Q1Il0uYXN0eXBlKGZsb2F0KQogICAgY3VydiA9IGRmWyJwcmVfcHNfdHZ0X2N1cnZhdHVyZSJdLmFzdHlwZShmbG9hdCkKICAgIGRmWyJmX2V4dHJhcF9zbG9wZTIwX2RNRCJdID0gczIwICogZG1kCiAgICBkZlsiZl9leHRyYXBfc2xvcGU1X2RNRCJdID0gczUgKiBkbWQKICAgIGRmWyJmX2V4dHJhcF9xdWFkX2RNRCJdID0gczIwICogZG1kICsgMC41ICogY3VydiAqIGRtZCAqIGRtZAogICAgZGZbImZfZXh0cmFwX3oiXSA9IGRmWyJmX2R0dnRfZHpfcHJlIl0uYXN0eXBlKGZsb2F0KSAqIGR6CiAgICBkZlsiZl9leHRyYXBfZGlzYWdyZWUiXSA9IChkZlsiZl9leHRyYXBfc2xvcGUyMF9kTUQiXSAtIGRmWyJmX2V4dHJhcF96Il0pLmFicygpCiAgICByZXR1cm4gZGYKCgpkZWYgZW5yaWNoKGRmOiBwZC5EYXRhRnJhbWUsIGdsb2JhbF9ncl9tZWFuOiBmbG9hdCkgLT4gcGQuRGF0YUZyYW1lOgogICAgZGYgPSBkZi5tZXJnZSh0cmFqX3Blcl93ZWxsKGRmKSwgb249IndlbGxfaWQiLCBob3c9ImxlZnQiKQogICAgZGYgPSB0cmFqX3Blcl9yb3coZGYpCiAgICBkZiA9IGRmLm1lcmdlKGdyX3Blcl93ZWxsKGRmLCBnbG9iYWxfZ3JfbWVhbiksIG9uPSJ3ZWxsX2lkIiwgaG93PSJsZWZ0IikKICAgIGRmID0gZ3JfcGVyX3JvdyhkZiwgZ2xvYmFsX2dyX21lYW4pCiAgICBkZiA9IGRmLm1lcmdlKGdlb21fcGVyX3dlbGwoZGYpLCBvbj0id2VsbF9pZCIsIGhvdz0ibGVmdCIpCiAgICBkZiA9IGdlb21fcGVyX3JvdyhkZikKICAgIHJldHVybiBkZgoKCmRlZiBtYWtlX2ZvbGRzKHRyYWluOiBwZC5EYXRhRnJhbWUsIG5fc3BsaXRzOiBpbnQgPSBOX1NQTElUUykgLT4gZGljdDoKICAgIHN0YXRzID0gKHRyYWluW3RyYWluWyJpc190YXJnZXQiXV0uZ3JvdXBieSgid2VsbF9pZCIsIGFzX2luZGV4PUZhbHNlKQogICAgICAgICAgICAgLmFnZyh0YXJnZXRfcm93cz0oInJvd19pZHgiLCAic2l6ZSIpKSkKICAgIGxvYWRzID0gWzBdICogbl9zcGxpdHMKICAgIGZvbGRfb2YgPSB7fQogICAgZm9yIHJvdyBpbiBzdGF0cy5zb3J0X3ZhbHVlcygidGFyZ2V0X3Jvd3MiLCBhc2NlbmRpbmc9RmFsc2UpLml0ZXJ0dXBsZXMoaW5kZXg9RmFsc2UpOgogICAgICAgIGYgPSBtaW4ocmFuZ2Uobl9zcGxpdHMpLCBrZXk9bGFtYmRhIGk6IGxvYWRzW2ldKQogICAgICAgIGxvYWRzW2ZdICs9IGludChyb3cudGFyZ2V0X3Jvd3MpCiAgICAgICAgZm9sZF9vZltyb3cud2VsbF9pZF0gPSBmCiAgICByZXR1cm4gZm9sZF9vZgoKCiMg4pSA4pSAIFBhcnRpY2xlIEZpbHRlciAodHVuZWQpIG9uIHRlc3Qgd2VsbHMg4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSA4pSACmRlZiBsb2FkX3R5cGV3ZWxsKHNwbGl0X2RpcjogUGF0aCwgd2VsbF9pZDogc3RyKSAtPiBwZC5EYXRhRnJhbWU6CiAgICBwID0gc3BsaXRfZGlyIC8gZiJ7d2VsbF9pZH1fX3R5cGV3ZWxsLmNzdiIKICAgIHR3ID0gcGQucmVhZF9jc3YocCkKICAgIHJldHVybiB0d1tbIlRWVCIsICJHUiJdXS5jb3B5KCkKCgpkZWYgcGZfc2luZ2xlKHR3X3R2dCwgdHdfZ3IsIG1kX3YsIHpfdiwgZ3JfdiwgZ3MsIGlyLCBsYXN0X3R2dCwgbGFzdF9aLCBsYXN0X01ELCBzZWVkKToKICAgIG4gPSBsZW4obWRfdikKICAgIGlmIG4gPT0gMDoKICAgICAgICByZXR1cm4gbnAuemVyb3MoMCksIDAuMAogICAgTiA9IFBGX1BBUlRJQ0xFUwogICAgcm5nID0gbnAucmFuZG9tLmRlZmF1bHRfcm5nKHNlZWQpCiAgICBwb3MgPSAobGFzdF90dnQgKyBsYXN0X1opICsgUEZfSU5JVF9TUFJFQUQgKiBybmcuc3RhbmRhcmRfbm9ybWFsKE4pCiAgICByYXRlID0gaXIgKyAwLjAxICogcm5nLnN0YW5kYXJkX25vcm1hbChOKQogICAgdyA9IG5wLm9uZXMoTikgLyBOCiAgICByZXMgPSBucC5lbXB0eShuKTsgcHJldl9NRCA9IGxhc3RfTUQ7IGxvZ19saWsgPSAwLjAKICAgIGxvID0gdHdfdHZ0WzBdIC0gMTAwOyBoaSA9IHR3X3R2dFstMV0gKyAxMDAKICAgIGZvciBpIGluIHJhbmdlKG4pOgogICAgICAgIGRtX3N0ZXAgPSBtYXgobWRfdltpXSAtIHByZXZfTUQsIDEuMCkKICAgICAgICByYXRlID0gUEZfTU9NICogcmF0ZSArIFBGX1ZOICogcm5nLnN0YW5kYXJkX25vcm1hbChOKQogICAgICAgIHBvcyA9IHBvcyArIHJhdGUgKiBkbV9zdGVwICsgUEZfUE4gKiBybmcuc3RhbmRhcmRfbm9ybWFsKE4pCiAgICAgICAgdHZ0X3AgPSBucC5jbGlwKHBvcyAtIHpfdltpXSwgbG8sIGhpKTsgcG9zID0gdHZ0X3AgKyB6X3ZbaV0KICAgICAgICBlZyA9IG5wLmludGVycCh0dnRfcCwgdHdfdHZ0LCB0d19ncik7IGQgPSAoZ3JfdltpXSAtIGVnKSAvIGdzCiAgICAgICAgbGsgPSBucC5tYXhpbXVtKG5wLmV4cCgtMC41ICogbnAubWluaW11bShkICogZCwgNjAwLikpLCAxZS0zMDApCiAgICAgICAgbG9nX2xpayArPSBucC5sb2cobWF4KGZsb2F0KCh3ICogbGspLnN1bSgpKSwgMWUtMzAwKSkKICAgICAgICB3ID0gdyAqIGxrOyB3cyA9IHcuc3VtKCk7IHcgPSB3IC8gd3MgaWYgd3MgPiAwIGVsc2UgbnAub25lcyhOKSAvIE4KICAgICAgICBpZiAxLjAgLyAodyAqIHcpLnN1bSgpIDwgUEZfUkVTQU1QICogTjoKICAgICAgICAgICAgY3VtID0gbnAuY3Vtc3VtKHcpOyB1MCA9IHJuZy51bmlmb3JtKDAsIDEuMCAvIE4pCiAgICAgICAgICAgIGlkeCA9IG5wLmNsaXAobnAuc2VhcmNoc29ydGVkKGN1bSwgdTAgKyBucC5hcmFuZ2UoTikgLyBOKSwgMCwgTiAtIDEpCiAgICAgICAgICAgIHBvcyA9IHBvc1tpZHhdICsgUEZfUlAgKiBybmcuc3RhbmRhcmRfbm9ybWFsKE4pOyByYXRlID0gcmF0ZVtpZHhdICsgUEZfUlIgKiBybmcuc3RhbmRhcmRfbm9ybWFsKE4pCiAgICAgICAgICAgIHcgPSBucC5vbmVzKE4pIC8gTgogICAgICAgIHJlc1tpXSA9IGZsb2F0KG5wLmRvdCh3LCBwb3MgLSB6X3ZbaV0pKTsgcHJldl9NRCA9IG1kX3ZbaV0KICAgIHJldHVybiByZXMsIGxvZ19saWsKCgpkZWYgcGZfYnVpbGRfcGF5bG9hZChnOiBwZC5EYXRhRnJhbWUsIHR3OiBwZC5EYXRhRnJhbWUpIC0+IGRpY3Q6CiAgICAiIiIxIHdlbGwg44GuUEblhaXlipsobnVtcHnphY3liJcp44KS57WE44G/56uL44Gm44CCcGlja2xl5Y+v6IO944GqZGljdOOBp+i/lOOBmSjjg57jg6vjg4Hjg5fjg63jgrvjgrnnlKgp44CCIiIiCiAgICBnID0gZy5zb3J0X3ZhbHVlcygicm93X2lkeCIpCiAgICBrbm93biA9IGdbZ1siaXNfa25vd25fdHZ0Il0uYXN0eXBlKGJvb2wpXQogICAgdGd0ID0gZ1tnWyJpc190YXJnZXQiXS5hc3R5cGUoYm9vbCldCiAgICB3aWQgPSBzdHIodGd0WyJ3ZWxsX2lkIl0uaWxvY1swXSkKICAgIGFuY2hvciA9IGZsb2F0KHRndFsibGFzdF9rbm93bl9UVlQiXS5pbG9jWzBdKQogICAgbiA9IGludChsZW4odGd0KSkKICAgIGlmIHR3IGlzIE5vbmUgb3IgbGVuKHR3KSA8IDIgb3IgbGVuKGtub3duKSA8IDI6CiAgICAgICAgcmV0dXJuIHsid2lkIjogd2lkLCAibiI6IG4sICJub190dyI6IFRydWUsICJhbmNob3IiOiBhbmNob3J9CiAgICB0d19zID0gdHcuc29ydF92YWx1ZXMoIlRWVCIpLmRyb3BfZHVwbGljYXRlcygiVFZUIikKICAgIHR3X3R2dCA9IHR3X3NbIlRWVCJdLnRvX251bXB5KGZsb2F0KTsgdHdfZ3IgPSB0d19zWyJHUiJdLmZpbGxuYSh0d19zWyJHUiJdLm1lYW4oKSkudG9fbnVtcHkoZmxvYXQpCiAgICBncl9mdWxsID0gZ1siR1IiXS5pbnRlcnBvbGF0ZShsaW1pdF9kaXJlY3Rpb249ImJvdGgiKS5maWxsbmEoZmxvYXQobnAubmFubWVhbih0d19ncikpKS50b19udW1weShmbG9hdCkKICAgIHRndF9tYXNrID0gZ1siaXNfdGFyZ2V0Il0uYXN0eXBlKGJvb2wpLnRvX251bXB5KCkKICAgIGdyX3YgPSBncl9mdWxsW3RndF9tYXNrXQogICAga190dnQgPSBrbm93blsiVFZUX2lucHV0Il0udG9fbnVtcHkoZmxvYXQpOyBrX2dyID0ga25vd25bIkdSIl0uZmlsbG5hKDApLnRvX251bXB5KGZsb2F0KQogICAgZ3MgPSBmbG9hdChucC5jbGlwKG5wLm5hbnN0ZChrX2dyIC0gbnAuaW50ZXJwKGtfdHZ0LCB0d190dnQsIHR3X2dyKSksIDEwLiwgNjAuKSkKICAgIHRhaWwgPSBrbm93bi50YWlsKDMwKQogICAgZHQgPSBucC5kaWZmKHRhaWxbIlRWVF9pbnB1dCJdLnRvX251bXB5KGZsb2F0KSk7IGR6ID0gbnAuZGlmZih0YWlsWyJaIl0udG9fbnVtcHkoZmxvYXQpKTsgZG0gPSBucC5kaWZmKHRhaWxbIk1EIl0udG9fbnVtcHkoZmxvYXQpKQogICAgbW0gPSBkbSA+IDAKICAgIGlyID0gZmxvYXQobnAubWVkaWFuKChkdCArIGR6KVttbV0gLyBkbVttbV0pKSBpZiBtbS5zdW0oKSA+PSAzIGVsc2UgMC4wCiAgICBsYXN0ID0ga25vd24uaWxvY1stMV0KICAgIHJldHVybiB7IndpZCI6IHdpZCwgIm4iOiBuLCAibm9fdHciOiBGYWxzZSwgImFuY2hvciI6IGFuY2hvciwKICAgICAgICAgICAgInR3X3R2dCI6IHR3X3R2dCwgInR3X2dyIjogdHdfZ3IsCiAgICAgICAgICAgICJtZF92IjogdGd0WyJNRCJdLnRvX251bXB5KGZsb2F0KSwgInpfdiI6IHRndFsiWiJdLnRvX251bXB5KGZsb2F0KSwgImdyX3YiOiBncl92LAogICAgICAgICAgICAiZ3MiOiBncywgImlyIjogaXIsICJsYXN0X3R2dCI6IGZsb2F0KGxhc3RbIlRWVF9pbnB1dCJdKSwKICAgICAgICAgICAgImxhc3RfWiI6IGZsb2F0KGxhc3RbIloiXSksICJsYXN0X01EIjogZmxvYXQobGFzdFsiTUQiXSl9CgoKZGVmIHBmX3dvcmtlcihwOiBkaWN0KToKICAgICIiIjEgd2VsbCDjgpIgMTI4IHNlZWQg5bCk5bqm5Yqg6YeN44Ki44Oz44K144Oz44OW44OrKOODnuODq+ODgeODl+ODreOCu+OCueOBrnVuaXQp44CCKHdpZCwgcHJlZCkg44KS6L+U44GZ44CCIiIiCiAgICB3aWQgPSBwWyJ3aWQiXTsgbiA9IHBbIm4iXQogICAgaWYgbiA9PSAwOgogICAgICAgIHJldHVybiB3aWQsIG5wLnplcm9zKDApCiAgICBpZiBwLmdldCgibm9fdHciLCBGYWxzZSk6CiAgICAgICAgcmV0dXJuIHdpZCwgbnAuZnVsbChuLCBwWyJhbmNob3IiXSkKICAgIHByZWRzID0gbnAuZW1wdHkoKFBGX1NFRURTLCBuKSk7IGxpa3MgPSBucC5lbXB0eShQRl9TRUVEUykKICAgIGZvciBzIGluIHJhbmdlKFBGX1NFRURTKToKICAgICAgICBwcmVkc1tzXSwgbGlrc1tzXSA9IHBmX3NpbmdsZShwWyJ0d190dnQiXSwgcFsidHdfZ3IiXSwgcFsibWRfdiJdLCBwWyJ6X3YiXSwgcFsiZ3JfdiJdLAogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgIHBbImdzIl0sIHBbImlyIl0sIHBbImxhc3RfdHZ0Il0sIHBbImxhc3RfWiJdLCBwWyJsYXN0X01EIl0sIHMpCiAgICB3dHMgPSBucC5leHAoKGxpa3MgLSBsaWtzLm1heCgpKSAvIFBGX1NDQUxFKTsgd3RzIC89IHd0cy5zdW0oKQogICAgcmV0dXJuIHdpZCwgKHd0c1s6LCBOb25lXSAqIHByZWRzKS5zdW0oMCkKCgojIOKUgOKUgCBtYWluIOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgOKUgApkZWYgbWFpbigpIC0+IE5vbmU6CiAgICBwcmludChmIklOUFVUX0RJUj17SU5QVVRfRElSfSIpCiAgICB0cmFpbiA9IGxvYWRfYmFzZShUUkFJTl9ESVIsICJ0cmFpbiIpCiAgICB0ZXN0ID0gbG9hZF9iYXNlKFRFU1RfRElSLCAidGVzdCIpCiAgICBzYW1wbGUgPSBwZC5yZWFkX2NzdihTQU1QTEVfU1VCX1BBVEgpCgogICAgZ2xvYmFsX2dyX21lYW4gPSBmbG9hdCh0cmFpbi5sb2NbfnRyYWluWyJpc19ncl9taXNzaW5nIl0uYXN0eXBlKGJvb2wpLCAiR1IiXS5tZWFuKCkpCiAgICBwcmludChmImdsb2JhbF9ncl9tZWFuPXtnbG9iYWxfZ3JfbWVhbjouNGZ9IikKCiAgICAjIOKUgOKUgCBnZW9tIChMaWdodEdCTSwgNS1mb2xkIGF2ZyB0ZXN0KSDilIDilIAKICAgIHRyYWluID0gZW5yaWNoKHRyYWluLCBnbG9iYWxfZ3JfbWVhbikKICAgIHRlc3QgPSBlbnJpY2godGVzdCwgZ2xvYmFsX2dyX21lYW4pCiAgICBmb2xkX29mID0gbWFrZV9mb2xkcyh0cmFpbikKICAgIHRyYWluWyJmb2xkIl0gPSB0cmFpblsid2VsbF9pZCJdLm1hcChmb2xkX29mKQogICAgdHJhaW5fdCA9IHRyYWluW3RyYWluWyJpc190YXJnZXQiXS5hc3R5cGUoYm9vbCldLmNvcHkoKQogICAgdGVzdF90ID0gdGVzdFt0ZXN0WyJpc190YXJnZXQiXS5hc3R5cGUoYm9vbCldLmNvcHkoKQogICAgeV9kZWx0YSA9IHRyYWluX3RbIlRWVCJdLmFzdHlwZShmbG9hdCkgLSB0cmFpbl90WyJsYXN0X2tub3duX1RWVCJdLmFzdHlwZShmbG9hdCkKICAgIHBhcmFtcyA9IHsib2JqZWN0aXZlIjogInJlZ3Jlc3Npb24iLCAibWV0cmljIjogInJtc2UiLCAibGVhcm5pbmdfcmF0ZSI6IDAuMDUsCiAgICAgICAgICAgICAgIm51bV9sZWF2ZXMiOiA2MywgIm1heF9kZXB0aCI6IC0xLCAibWluX2RhdGFfaW5fbGVhZiI6IDUwLAogICAgICAgICAgICAgICJmZWF0dXJlX2ZyYWN0aW9uIjogMC45LCAiYmFnZ2luZ19mcmFjdGlvbiI6IDAuOSwgImJhZ2dpbmdfZnJlcSI6IDEsCiAgICAgICAgICAgICAgImxhbWJkYV9sMiI6IDEuMCwgInZlcmJvc2l0eSI6IC0xLCAic2VlZCI6IDQyLCAibnVtX3RocmVhZHMiOiA0fQogICAgdGVzdF9nZW9tX2RlbHRhID0gbnAuemVyb3MobGVuKHRlc3RfdCksIGR0eXBlPWZsb2F0KQogICAgZm9yIGZvbGQgaW4gc29ydGVkKHRyYWluX3RbImZvbGQiXS51bmlxdWUoKSk6CiAgICAgICAgdm0gPSB0cmFpbl90WyJmb2xkIl0uZXEoZm9sZCkudG9fbnVtcHkoKTsgdG0gPSB+dm0KICAgICAgICBtb2RlbCA9IGxnYi5MR0JNUmVncmVzc29yKCoqcGFyYW1zLCBuX2VzdGltYXRvcnM9MTUwMCkKICAgICAgICBtb2RlbC5maXQodHJhaW5fdC5sb2NbdG0sIEFMTF9GRUFUVVJFU10sIHlfZGVsdGEubG9jW3RtXSwKICAgICAgICAgICAgICAgICAgZXZhbF9zZXQ9Wyh0cmFpbl90LmxvY1t2bSwgQUxMX0ZFQVRVUkVTXSwgeV9kZWx0YS5sb2Nbdm1dKV0sCiAgICAgICAgICAgICAgICAgIGV2YWxfbWV0cmljPSJybXNlIiwgY2FsbGJhY2tzPVtsZ2IuZWFybHlfc3RvcHBpbmcoNTAsIHZlcmJvc2U9RmFsc2UpXSkKICAgICAgICBiZXN0ID0gaW50KG1vZGVsLmJlc3RfaXRlcmF0aW9uXyBvciBtb2RlbC5uX2VzdGltYXRvcnMpCiAgICAgICAgdGVzdF9nZW9tX2RlbHRhICs9IG1vZGVsLnByZWRpY3QodGVzdF90W0FMTF9GRUFUVVJFU10sIG51bV9pdGVyYXRpb249YmVzdCkgLyBOX1NQTElUUwogICAgICAgIHByaW50KGYiZ2VvbSBmb2xkIHtmb2xkfTogYmVzdF9pdGVyPXtiZXN0fSIpCiAgICB0ZXN0X3QgPSB0ZXN0X3QuY29weSgpCiAgICB0ZXN0X3RbImdlb20iXSA9IHRlc3RfdFsibGFzdF9rbm93bl9UVlQiXS5hc3R5cGUoZmxvYXQpLnRvX251bXB5KCkgKyB0ZXN0X2dlb21fZGVsdGEKCiAgICAjIOKUgOKUgCBQRiBvbiBlYWNoIHRlc3Qgd2VsbCAobXVsdGlwcm9jZXNzIG92ZXIgd2VsbHM7IENWLWlkZW50aWNhbCB0byBzaW5nbGUtdGhyZWFkKSDilIDilIAKICAgIHBheWxvYWRzID0gW10KICAgIGZvciB3aWQsIGcgaW4gdGVzdC5ncm91cGJ5KCJ3ZWxsX2lkIiwgc29ydD1GYWxzZSk6CiAgICAgICAgaWYgbm90IGdbImlzX3RhcmdldCJdLmFueSgpOgogICAgICAgICAgICBjb250aW51ZQogICAgICAgIHBheWxvYWRzLmFwcGVuZChwZl9idWlsZF9wYXlsb2FkKGcsIGxvYWRfdHlwZXdlbGwoVEVTVF9ESVIsIHdpZCkpKQogICAgbl93ZWxscyA9IGxlbihwYXlsb2FkcykKICAgIHByaW50KGYiUEY6IHtuX3dlbGxzfSB0ZXN0IHdlbGxzLCB3b3JrZXJzPXtQRl9XT1JLRVJTfSwgc2VlZHM9e1BGX1NFRURTfSIpCiAgICBwZl9ieV93aWQgPSB7fQogICAgaWYgUEZfV09SS0VSUyA+IDEgYW5kIG5fd2VsbHMgPiAxOgogICAgICAgIHdpdGggUHJvY2Vzc1Bvb2xFeGVjdXRvcihtYXhfd29ya2Vycz1QRl9XT1JLRVJTKSBhcyBleDoKICAgICAgICAgICAgZm9yIGssICh3aWQsIHByZWQpIGluIGVudW1lcmF0ZShleC5tYXAocGZfd29ya2VyLCBwYXlsb2FkcywgY2h1bmtzaXplPTEpKToKICAgICAgICAgICAgICAgIHBmX2J5X3dpZFt3aWRdID0gcHJlZAogICAgICAgICAgICAgICAgaWYgKGsgKyAxKSAlIDUwID09IDA6CiAgICAgICAgICAgICAgICAgICAgcHJpbnQoZiIgIFBGIHtrKzF9L3tuX3dlbGxzfSB3ZWxscyIsIGZsdXNoPVRydWUpCiAgICBlbHNlOgogICAgICAgIGZvciBrLCBwIGluIGVudW1lcmF0ZShwYXlsb2Fkcyk6CiAgICAgICAgICAgIHdpZCwgcHJlZCA9IHBmX3dvcmtlcihwKQogICAgICAgICAgICBwZl9ieV93aWRbd2lkXSA9IHByZWQKICAgIHRlc3RfdFsicGYiXSA9IG5wLm5hbgogICAgZm9yIHdpZCwgcHJlZCBpbiBwZl9ieV93aWQuaXRlbXMoKToKICAgICAgICBvcmRlciA9IHRlc3RfdC5sb2NbdGVzdF90WyJ3ZWxsX2lkIl0uZXEod2lkKV0uc29ydF92YWx1ZXMoInJvd19pZHgiKS5pbmRleAogICAgICAgIHRlc3RfdC5sb2Nbb3JkZXIsICJwZiJdID0gcHJlZAoKICAgICMg4pSA4pSAIGJsZW5kICsgc21vb3RoIOKUgOKUgAogICAgYSA9IHRlc3RfdFsibGFzdF9rbm93bl9UVlQiXS5hc3R5cGUoZmxvYXQpLnRvX251bXB5KCkKICAgIGJsZW5kID0gYSArIEJMRU5EX1BGICogKHRlc3RfdFsicGYiXS50b19udW1weShmbG9hdCkgLSBhKSArIEJMRU5EX0dFT00gKiAodGVzdF90WyJnZW9tIl0udG9fbnVtcHkoZmxvYXQpIC0gYSkKICAgIHRlc3RfdFsiYmxlbmQiXSA9IGJsZW5kCiAgICB0ZXN0X3QgPSB0ZXN0X3Quc29ydF92YWx1ZXMoWyJ3ZWxsX2lkIiwgInJvd19pZHgiXSkKICAgIHRlc3RfdFtQUkVEX0NPTF0gPSB0ZXN0X3QuZ3JvdXBieSgid2VsbF9pZCIsIHNvcnQ9RmFsc2UpWyJibGVuZCJdLnRyYW5zZm9ybSgKICAgICAgICBsYW1iZGEgeDogeC5yb2xsaW5nKFNNT09USF9XLCBtaW5fcGVyaW9kcz0xLCBjZW50ZXI9VHJ1ZSkubWVhbigpKQoKICAgIHN1Ym1pc3Npb24gPSBzYW1wbGVbWyJpZCJdXS5tZXJnZSgKICAgICAgICB0ZXN0X3RbWyJpZCIsIFBSRURfQ09MXV0ucmVuYW1lKGNvbHVtbnM9e1BSRURfQ09MOiAidHZ0In0pLCBvbj0iaWQiLCBob3c9ImxlZnQiKQogICAgaWYgc3VibWlzc2lvblsidHZ0Il0uaXNuYSgpLmFueSgpOgogICAgICAgIHJhaXNlIFZhbHVlRXJyb3IoInN1Ym1pc3Npb24gY29udGFpbnMgbWlzc2luZyBwcmVkaWN0aW9ucyIpCiAgICBzdWJtaXNzaW9uLnRvX2NzdihPVVRfUEFUSCwgaW5kZXg9RmFsc2UpCiAgICBwcmludChmIndyb3RlIHtPVVRfUEFUSH0gcm93cz17bGVuKHN1Ym1pc3Npb24pfSAgdHZ0W3tzdWJtaXNzaW9uLnR2dC5taW4oKTouMWZ9LHtzdWJtaXNzaW9uLnR2dC5tYXgoKTouMWZ9XSIpCgoKaWYgX19uYW1lX18gPT0gIl9fbWFpbl9fIjoKICAgIG1haW4oKQo="
+_a2_exp026_py = _a2_work / "_exp026_runtime.py"
+_a2_exp026_py.write_text(_a2_b64.b64decode(_A2_EXP026_B64).decode())
+print("[A2] running embedded exp026 ...", flush=True)
+_a2_r = _a2_sp.run([_a2_sys.executable, str(_a2_exp026_py)],
+                   capture_output=True, text=True)
+print("[A2] exp026 rc=", _a2_r.returncode, flush=True)
+if _a2_r.stdout: print("[A2][exp026 stdout tail]\n" + _a2_r.stdout[-1500:], flush=True)
+if _a2_r.returncode != 0:
+    print("[A2][exp026 stderr tail]\n" + (_a2_r.stderr or "")[-2000:], flush=True)
+    raise RuntimeError("exp026 subprocess failed rc=%d" % _a2_r.returncode)
+
+_a2_exp026_out = _a2_work / "submission.csv"   # exp026 overwrote this
+_a2_exp026_saved = _a2_work / "exp026_submission.csv"
+_a2_sh.copy2(str(_a2_exp026_out), str(_a2_exp026_saved))
+
+# --- blend ---
+_a2_f = _a2_pd.read_csv(_a2_fork_saved).rename(columns={"tvt": "f"})
+_a2_e = _a2_pd.read_csv(_a2_exp026_saved).rename(columns={"tvt": "e"})
+_a2_m = _a2_f[["id", "f"]].merge(_a2_e[["id", "e"]], on="id", how="outer")
+_a2_m["tvt"] = _A2_W_FORK * _a2_m["f"] + _A2_W_EXP026 * _a2_m["e"]
+_a2_m.loc[_a2_m["f"].isna(), "tvt"] = _a2_m.loc[_a2_m["f"].isna(), "e"]
+_a2_m.loc[_a2_m["e"].isna(), "tvt"] = _a2_m.loc[_a2_m["e"].isna(), "f"]
+if _a2_m["tvt"].isna().any():
+    raise ValueError("blend has %d NaN" % int(_a2_m["tvt"].isna().sum()))
+_a2_m[["id", "tvt"]].to_csv(_a2_work / "submission.csv", index=False)
+print("[A2] BLEND wrote %s rows=%d tvt[%.1f,%.1f] mean=%.2f (w=%.2f/%.2f)" % (
+    str(_a2_work / "submission.csv"), len(_a2_m),
+    _a2_m.tvt.min(), _a2_m.tvt.max(), _a2_m.tvt.mean(),
+    _A2_W_FORK, _A2_W_EXP026), flush=True)

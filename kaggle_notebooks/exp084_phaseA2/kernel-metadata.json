@@ -8,8 +8,8 @@
   "enable_gpu": "false",
   "enable_tpu": "false",
   "enable_internet": "false",
-  "dataset_sources": [],
+  "dataset_sources": ["phongnguyn23021656/koolbox-offline","fleongg/rogii-claude-models-pub","ravaghi/wellbore-geology-prediction-artifacts"],
   "competition_sources": ["rogii-wellbore-geology-prediction"],
-  "kernel_sources": ["sol12378/rogii-sp45-fleongg-fork"],
+  "kernel_sources": [],
   "model_sources": []
 }

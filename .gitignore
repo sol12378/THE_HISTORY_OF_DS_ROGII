@@ -102,3 +102,6 @@ experiments/*/oof.csv
 experiments/*/perscale_oof.csv
 scripts/debug_exp054.py
 .gitignore_experiments
+
+# exp084 phaseA2 dep: exp026 prediction dump (id,tvt) - keep out of public repo
+experiments/*/*_sub.csv
