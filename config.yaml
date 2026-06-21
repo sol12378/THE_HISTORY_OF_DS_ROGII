@@ -1,0 +1,69 @@
+competition:
+  id: rogii-wellbore-geology-prediction
+  title: ROGII - Wellbore Geology Prediction
+  task_type: geoscience_sequence
+  type: regression
+  platform: kaggle
+  kaggle_competition: rogii-wellbore-geology-prediction
+  deadline: "2026-08-05"
+  encoding: "utf-8"
+  source_repository: "https://github.com/sol12378/THE_HISTORY_OF_DS_ROGII"
+
+data:
+  # Raw Kaggle files should live under {data_root}/rogii-wellbore-geology-prediction/raw/.
+  # The inherited workspace also contains a project-local data/ tree for historical folds
+  # and lightweight artifacts.
+  train: "train"
+  test: "test"
+  sample_submit: "sample_submission.csv"
+  id_column: "id"
+  target_column: "TVT"
+  prediction_column: "tvt"
+  group_column: "well_id"
+  horizontal_file_suffix: "__horizontal_well.csv"
+  typewell_file_suffix: "__typewell.csv"
+  known_target_column: "TVT_input"
+  gr_column: "GR"
+
+submission:
+  daily_limit: 5
+  timezone: "Asia/Tokyo"
+  format:
+    has_header: true
+    columns: ["id", "tvt"]
+    id_column: "id"
+    prediction_columns: ["tvt"]
+    n_rows: 14151
+    allow_extra_columns: false
+
+validation:
+  group_column: "well_id"
+  holdout_fraction: 0.0
+  primary_cv: "GroupKFold by well_id, evaluated only on missing TVT_input tail rows"
+  secondary_cv:
+    - "spatial/field-level holdout"
+    - "typewell-similarity holdout"
+    - "high-vs-low GR-missingness slice checks"
+  leakage_policy:
+    public_test_train_overlap: "documented; use only for pipeline/LB calibration, not model selection"
+    forbidden_train_only_columns: ["ANCC", "ASTNU", "ASTNL", "EGFDU", "EGFDL", "BUDA", "Geology"]
+
+cv:
+  n_splits: 5
+  seed: 42
+  seeds: [42, 43, 44]
+  metric: "rmse"
+
+workspace:
+  inherited_path: "workspace"
+  experiment_index: "workspace/ROGII_kaggle_obsidian/05_Experiments/EXP_Index.md"
+  lb_tracking: "workspace/ROGII_kaggle_obsidian/09_Submissions/LB_Tracking.md"
+  best_known_lb: 7.625
+  best_known_source: "exp080 sp45-fleongg fork"
+
+llm:
+  base_url: "http://localhost:8000/v1"
+  model: "Qwen/Qwen3.5-35B-A3B-GPTQ-Int4"
+  api_key: "EMPTY"
+  temperature: 0.6
+  max_iterations: 10

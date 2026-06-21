@@ -1,0 +1,107 @@
+# external downloaded Kaggle datasets (large: 7GB train.csv, model pkls) - keep out of public repo
+data/external/*
+!data/external/.gitkeep
+# experiment intermediate artifacts (logs / submissions / per-row dumps / kaggle outputs)
+experiments/*/kernel_output/
+experiments/*/*_stdout.txt
+experiments/*/log_*.txt
+experiments/*/log.txt
+experiments/*/*_log.txt
+experiments/*/explore_report.md
+experiments/*/submit_build_log*.txt
+experiments/*/explore_log.txt
+experiments/*/notebook_params.txt
+experiments/*/submission*.csv
+experiments/*/*_per_well.csv
+experiments/*/*_preds.csv
+experiments/*/preds*.csv
+# all OOF-like per-row prediction dumps in experiments (only oof.csv was covered before)
+experiments/*/oof_*.csv
+experiments/*/*_oof.csv
+# pulled external public notebooks (reference only, not redistributed)
+external_notebooks/
+# decoded kernel internals (large embedded/derived code)
+kaggle_notebooks/*/_decoded_*.py
+
+.DS_Store
+.env
+.kaggle/
+.venv/
+.obsidian/
+**/.obsidian/
+Untitled
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+docs/*
+!docs/*.md
+
+data/raw/*
+data/interim/*
+data/processed/*
+data/cache/*
+data/submissions/*
+outputs/*
+experiments/*/oof.csv
+experiments/*/submission.csv
+experiments/*/*.pkl
+experiments/*/*.model
+experiments/*/*.joblib
+# large per-row derived prediction dumps (OOF-like; keep out of public repo)
+experiments/*/row_predictions.csv
+experiments/*/rows.csv
+experiments/*/*_rows.csv
+experiments/*/*.parquet
+*.log
+
+# tool/runtime artifacts
+catboost_info/
+.claude/scheduled_tasks.lock
+
+!data/raw/.gitkeep
+!data/interim/.gitkeep
+!data/processed/.gitkeep
+!data/folds/.gitkeep
+!data/external/.gitkeep
+!data/submissions/.gitkeep
+!data/cache/.gitkeep
+!outputs/figures/.gitkeep
+!outputs/logs/.gitkeep
+!outputs/models/.gitkeep
+!outputs/oof/.gitkeep
+!outputs/predictions/.gitkeep
+!outputs/blends/.gitkeep
+
+# exp034 leak hybrid local outputs (sensitive prediction data)
+kaggle_notebooks/exp034_hybrid_leak/local_test_submission.csv
+experiments/exp034_hybrid_leak/diagnostic.csv
+experiments/exp034_hybrid_leak/submission.csv
+experiments/exp023_leak_lookup/submission.csv
+kaggle_notebooks/exp044_pure_leak/local_test_submission.csv
+experiments/*/test_pred.csv
+experiments/*/oof_best.csv
+experiments/*/blend_candidates/
+experiments/*/subset_check_details.csv
+experiments/*_smoke/
+final_kernel_check.py
+run_kernel_local_verify.sh
+.claude/
+_exp051_components/
+submission.csv
+test_kernel_features.py
+verify_exp043_p2.py
+experiments/exp051_local_verify/
+experiments/exp051_artifact_pf_blend/
+experiments/exp_broken_diagnosis/broken_wells.csv
+experiments/exp_selective_rescue/broken_signals.csv
+experiments/exp_selective_rescue/oof_selective.csv
+kaggle_notebooks/exp043_pipeline/
+experiments/exp067_field_lowo_blend/oof.csv
+experiments/exp056_field_surface/oof_full_773wells.csv
+experiments/*/oof.csv
+experiments/*/perscale_oof.csv
+scripts/debug_exp054.py
+.gitignore_experiments
+
+# exp084 phaseA2 dep: exp026 prediction dump (id,tvt) - keep out of public repo
+experiments/*/*_sub.csv

@@ -1,0 +1,36 @@
+exp_id: exp001_xgb_baseline
+seed: 42
+
+data:
+  train_path: data/raw/train.csv
+  test_path: data/raw/test.csv
+  sample_submission_path: data/raw/sample_submission.csv
+  fold_path: data/folds/folds_group_well_v001.csv
+
+features:
+  sets:
+    - basic
+
+target:
+  mode: direct
+  column: target
+
+model:
+  name: xgboost
+  params:
+    objective: reg:squarederror
+    learning_rate: 0.03
+    max_depth: 6
+    subsample: 0.8
+    colsample_bytree: 0.8
+    n_estimators: 1000
+
+training:
+  n_folds: 5
+  early_stopping_rounds: 100
+  max_train_minutes: 20
+
+output:
+  save_oof: true
+  save_submission: true
+  save_feature_importance: true

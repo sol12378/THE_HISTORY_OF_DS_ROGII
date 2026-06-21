@@ -1,0 +1,12 @@
+exp_id: exp006_tcn_sequence
+seed: 42
+features:
+  sets: [basic, anchor, depth_series]
+target:
+  mode: direct
+  column: target
+model:
+  name: tcn
+training:
+  n_folds: 5
+  max_train_minutes: 20

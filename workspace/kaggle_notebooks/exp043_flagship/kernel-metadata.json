@@ -1,0 +1,16 @@
+{
+  "id": "sol12378/rogii-exp043-flagship",
+  "title": "ROGII exp043 flagship",
+  "code_file": "rogii_exp043_flagship.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": [
+    "rogii-wellbore-geology-prediction"
+  ],
+  "kernel_sources": [],
+  "model_sources": []
+}

@@ -1,0 +1,14 @@
+{
+  "id": "sol12378/rogii-exp051-artifact-pf-blend",
+  "title": "ROGII exp051 artifact pf blend",
+  "code_file": "rogii_exp051.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": ["thbdh5765/rogii-v11-fresh-artifacts"],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

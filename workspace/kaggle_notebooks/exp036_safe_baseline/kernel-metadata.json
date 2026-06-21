@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp036-safe-baseline",
+  "title": "ROGII exp036 safe baseline (leak-free)",
+  "code_file": "rogii_exp036_safe_baseline.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

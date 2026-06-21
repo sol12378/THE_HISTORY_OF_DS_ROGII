@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp047-artifact-blend",
+  "title": "ROGII exp047 artifact blend",
+  "code_file": "rogii_exp047_artifact_blend.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "true",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": ["kojimar/rogii-sunny-v10-stack-helpers", "thbdh5765/rogii-v10-fresh-artifacts", "needless090/rogii-tabicl-mirror"],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

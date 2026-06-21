@@ -1,0 +1,56 @@
+schema_version: 1
+updated: 2026-06-20
+competition: rogii-wellbore-geology-prediction
+
+hypotheses:
+  - id: H1
+    text: "The strongest leak-safe baseline is a well-level sequence model that extrapolates from the last known TVT_input anchor using MD/Z trajectory features and smoothness constraints."
+    evidence: [competition_analysis, exp014_geom_extrap, exp015_seq_smooth]
+    status: open
+  - id: H2
+    text: "Particle-filter or Viterbi-style alignment between horizontal GR and typewell GR can outperform pure tabular models when tuned with well-level OOF and per-well diagnostics."
+    evidence: [exp022_particle_filter, exp024_multistage_blend, exp026_final_blend]
+    status: open
+  - id: H3
+    text: "Public test/train overlap can produce near-perfect lookup submissions, but it is a leakage artifact and must be isolated from generalization experiments."
+    evidence: [competition_analysis, exp023_leak_lookup, leakage_risk]
+    status: open
+  - id: H4
+    text: "Imported public notebook artifacts may improve LB, but they need OOF reconstruction, per-well attribution, and leakage classification before becoming a trusted base."
+    evidence: [exp073_public_assets_integration, LB_Tracking, exp080_sp45_fork]
+    status: open
+
+focus:
+  prefer_preprocessing:
+    - raw_csv_inventory
+    - well_tail_mask
+    - typewell_alignment_cache
+    - leakage_safe_feature_contracts
+  prefer_features:
+    - anchor_last_tvt
+    - delta_md_from_prediction_start
+    - delta_z_and_trajectory_curvature
+    - rolling_gr_and_gr_missingness
+    - typewell_gr_similarity
+  prefer_models:
+    - anchor_and_slope_rules
+    - lightgbm_xgboost_tabular
+    - particle_filter
+    - viterbi_or_beam_tracker
+    - calibrated_blends
+  try_regime:
+    - rebuild_best_leak_safe_oof
+    - reproduce_best_public_lb_artifact
+    - per_well_error_slice_to_next_experiment
+
+avoid:
+  - "Do not optimize only against public LB created by the documented train/test overlap."
+  - "Do not use train-only columns ANCC/ASTNU/ASTNL/EGFDU/EGFDL/BUDA or typewell Geology unless an equivalent test-side generation path is documented."
+  - "Do not use row-random CV; hold out full wells."
+  - "Do not mix NeuroGolf/ONNX/compiler assumptions into this competition."
+
+submission_policy:
+  require_multi_seed: true
+  require_cv_lb_consistency: true
+  require_leakage_classification: true
+  require_submission_gate: true

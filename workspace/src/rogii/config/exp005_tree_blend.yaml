@@ -1,0 +1,8 @@
+exp_id: exp005_tree_blend
+seed: 42
+blend:
+  experiments:
+    - exp002_lgb_anchor_delta
+    - exp003_cat_typewell
+    - exp004_xgb_spatial_rolling
+  method: weighted_average

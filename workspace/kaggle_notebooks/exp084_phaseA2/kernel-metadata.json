@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-phasea2-fork-pf-blend",
+  "title": "rogii phaseA2 fork pf blend",
+  "code_file": "rogii_phaseA2.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": ["phongnguyn23021656/koolbox-offline","fleongg/rogii-claude-models-pub","ravaghi/wellbore-geology-prediction-artifacts"],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

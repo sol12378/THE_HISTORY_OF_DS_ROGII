@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp037-w03",
+  "title": "ROGII exp037 leak w03",
+  "code_file": "rogii_exp037_w03.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

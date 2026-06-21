@@ -1,0 +1,37 @@
+exp_id: exp002_lgb_anchor_delta
+seed: 42
+
+data:
+  train_path: data/processed/train_base.parquet
+  test_path: data/processed/test_base.parquet
+  fold_path: data/folds/folds_group_well_v001.csv
+
+features:
+  sets:
+    - basic
+    - anchor
+
+target:
+  mode: delta_from_anchor
+  column: target
+
+model:
+  name: lightgbm
+  params:
+    objective: regression
+    learning_rate: 0.03
+    num_leaves: 64
+    feature_fraction: 0.8
+    bagging_fraction: 0.8
+    bagging_freq: 1
+    n_estimators: 3000
+
+training:
+  n_folds: 5
+  early_stopping_rounds: 100
+  max_train_minutes: 20
+
+output:
+  save_oof: true
+  save_submission: true
+  save_feature_importance: true

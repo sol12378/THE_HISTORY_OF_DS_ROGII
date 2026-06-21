@@ -1,0 +1,59 @@
+schema_version: 1
+competition: rogii-wellbore-geology-prediction
+default_timeout_minutes: 30
+actions:
+  data_contract:
+    script: scripts/rogii_build_base_tables.py
+    timeout_minutes: 45
+    description: Build processed base tables and verify raw/sample/test-tail contract.
+    args:
+      exp-id:
+        type: string
+        default: exp100_data_contract
+      raw-dir:
+        type: path
+        default: D:/Data_Science/data/rogii-wellbore-geology-prediction/raw
+  make_folds:
+    script: scripts/rogii_make_folds.py
+    timeout_minutes: 20
+    description: Build balanced GroupKFold-by-well folds.
+    args:
+      exp-id:
+        type: string
+        default: exp110_group_well_cv_v2
+      n-splits:
+        type: int
+        default: 5
+        min: 3
+        max: 10
+  anchor_repro:
+    script: scripts/exp120_anchor_repro.py
+    timeout_minutes: 20
+    description: Reproduce the leak-safe anchor baseline.
+    args:
+      exp-id:
+        type: string
+        default: exp120_anchor_repro
+  oof_slices:
+    script: scripts/rogii_oof_slices.py
+    timeout_minutes: 10
+    description: Generate per-well and fold diagnostics for an OOF file.
+    args:
+      exp-id:
+        type: string
+        required: true
+  exp008_gr_rolling:
+    script: scripts/exp008_gr_rolling.py
+    timeout_minutes: 60
+    description: Historical leak-safe LightGBM GR rolling experiment.
+    args: {}
+  exp022_particle_filter:
+    script: scripts/exp022_particle_filter.py
+    timeout_minutes: 120
+    description: Historical particle filter reproduction.
+    args: {}
+  exp026_final_blend:
+    script: scripts/exp026_final_blend.py
+    timeout_minutes: 30
+    description: Historical final PF/geom blend reproduction.
+    args: {}

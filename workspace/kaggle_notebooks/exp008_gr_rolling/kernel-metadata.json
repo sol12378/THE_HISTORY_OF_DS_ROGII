@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp008-gr-rolling",
+  "title": "ROGII exp008 GR rolling",
+  "code_file": "rogii_exp008_gr_rolling.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

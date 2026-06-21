@@ -1,0 +1,12 @@
+exp_id: exp004_xgb_spatial_rolling
+seed: 42
+features:
+  sets: [basic, anchor, spatial, rolling]
+target:
+  mode: delta_from_anchor
+  column: target
+model:
+  name: xgboost
+training:
+  n_folds: 5
+  max_train_minutes: 20

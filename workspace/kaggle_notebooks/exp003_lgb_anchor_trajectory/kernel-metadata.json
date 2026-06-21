@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp003-lgb-anchor-trajectory",
+  "title": "ROGII exp003 LGB anchor trajectory",
+  "code_file": "rogii_exp003_lgb_anchor_trajectory.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

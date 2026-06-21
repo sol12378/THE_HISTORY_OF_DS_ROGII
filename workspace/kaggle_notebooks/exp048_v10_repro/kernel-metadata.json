@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp048-v10-repro",
+  "title": "ROGII exp048 v10 repro",
+  "code_file": "rogii_exp048_v10_repro.ipynb",
+  "language": "python",
+  "kernel_type": "notebook",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": ["thbdh5765/rogii-v10-fresh-artifacts", "needless090/rogii-tabicl-mirror"],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

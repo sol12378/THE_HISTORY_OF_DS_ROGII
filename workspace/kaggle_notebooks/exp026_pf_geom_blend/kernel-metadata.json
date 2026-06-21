@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp026-pf-geom-blend",
+  "title": "ROGII exp026 PF geom blend",
+  "code_file": "rogii_exp026_pf_geom_blend.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": [],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}

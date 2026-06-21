@@ -1,0 +1,12 @@
+exp_id: exp003_cat_typewell
+seed: 42
+features:
+  sets: [basic, anchor, typewell]
+target:
+  mode: delta_from_anchor
+  column: target
+model:
+  name: catboost
+training:
+  n_folds: 5
+  max_train_minutes: 20

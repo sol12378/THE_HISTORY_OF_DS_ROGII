@@ -1,0 +1,15 @@
+{
+  "id": "sol12378/rogii-exp072-proj",
+  "title": "ROGII exp072 proj",
+  "code_file": "rogii_exp072.py",
+  "language": "python",
+  "kernel_type": "script",
+  "is_private": "true",
+  "enable_gpu": "false",
+  "enable_tpu": "false",
+  "enable_internet": "false",
+  "dataset_sources": ["thbdh5765/rogii-v11-fresh-artifacts"],
+  "competition_sources": ["rogii-wellbore-geology-prediction"],
+  "kernel_sources": [],
+  "model_sources": []
+}
