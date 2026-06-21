@@ -67,3 +67,8 @@ llm:
   api_key: "EMPTY"
   temperature: 0.6
   max_iterations: 10
+
+# 横断オーケストレーションの統一起動契約（orchestration.launcher が読む）。
+autonomous:
+  kind: session   # B層: 汎用 ProductionSession（RogiiTaskType.load_data が実データで成功＝無改修Temporal可）
+  # 代替（tuned bespoke）: workspace/scripts/rogii_autonomous_loop.py --mode bootstrap

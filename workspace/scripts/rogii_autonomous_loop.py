@@ -10,7 +10,10 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import traceback
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[4]
 SRC = ROOT / "src"
@@ -48,6 +51,11 @@ def main() -> None:
     parser.add_argument("--mode", choices=["bootstrap", "plan"], default="bootstrap")
     parser.add_argument("--plan-json", default=None, help="JSON plan file for mode=plan")
     parser.add_argument("--python", default=sys.executable)
+    parser.add_argument(
+        "--continue-on-error",
+        action="store_true",
+        help="Record failed actions and continue with the remaining plan.",
+    )
     args = parser.parse_args()
 
     plan = BOOTSTRAP_PLAN if args.mode == "bootstrap" else _load_plan(args.plan_json)
@@ -56,15 +64,32 @@ def main() -> None:
         action_id = step["action_id"]
         params = step.get("params") or {}
         print(f"[rogii-autonomous] action={action_id} params={params}", flush=True)
-        result = run_action(
-            workspace=WORKSPACE,
-            actions_path=ACTIONS,
-            action_id=action_id,
-            params=params,
-            python_exe=args.python,
-        )
-        results.append(result.__dict__)
-    print(json.dumps({"status": "completed", "results": results}, ensure_ascii=False, indent=2))
+        started = datetime.now(ZoneInfo("Asia/Tokyo")).isoformat()
+        try:
+            result = run_action(
+                workspace=WORKSPACE,
+                actions_path=ACTIONS,
+                action_id=action_id,
+                params=params,
+                python_exe=args.python,
+            )
+            results.append(result.__dict__)
+        except Exception as exc:
+            failed = {
+                "action_id": action_id,
+                "status": "failed",
+                "params": params,
+                "started_at": started,
+                "finished_at": datetime.now(ZoneInfo("Asia/Tokyo")).isoformat(),
+                "error": str(exc),
+                "traceback_tail": traceback.format_exc()[-6000:],
+            }
+            results.append(failed)
+            print(json.dumps(failed, ensure_ascii=False, indent=2), flush=True)
+            if not args.continue_on_error:
+                raise
+    status = "completed" if all(r.get("status") == "completed" for r in results) else "completed_with_failures"
+    print(json.dumps({"status": status, "results": results}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

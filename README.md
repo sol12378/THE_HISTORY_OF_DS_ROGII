@@ -1,3 +1,18 @@
+---
+type: competition
+comp_id: rogii-wellbore-geology-prediction
+title: ROGII - Wellbore Geology Prediction
+platform: kaggle
+task_type: geoscience_sequence
+status: active
+deadline: 2026-08-05
+metric: rmse
+best_cv: 8.79
+best_lb: 7.625
+rank:
+tags: [kaggle, geoscience_sequence, regression, wellbore, inherited-workspace]
+---
+
 # ROGII - Wellbore Geology Prediction
 
 Kaggle workspace integrated into the autonomous research base.
