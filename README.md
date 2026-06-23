@@ -8,7 +8,7 @@ status: active
 deadline: 2026-08-05
 metric: rmse
 best_cv: 8.79
-best_lb: 7.625
+best_lb: 7.168
 rank:
 tags: [kaggle, geoscience_sequence, regression, wellbore, inherited-workspace]
 ---
@@ -25,7 +25,8 @@ This is not NeuroGolf 2026. Treat it as a geoscience sequence-regression competi
 - Competition notes: `workspace/reports/competition_analysis.md`
 - Experiment index: `workspace/ROGII_kaggle_obsidian/05_Experiments/EXP_Index.md`
 - Submission/LB tracking: `workspace/ROGII_kaggle_obsidian/09_Submissions/LB_Tracking.md`
-- Best inherited LB noted in history: `7.625` from the exp080 sp45-fleongg fork
+- Best public LB target now tracked: `7.168` from `lightningv08/rogii-lb-7-168`
+- Submission floor: only promote candidates that can plausibly compete with the LB `7.1` public-notebook family.
 
 ## Operating Rules
 
@@ -40,8 +41,9 @@ This is not NeuroGolf 2026. Treat it as a geoscience sequence-regression competi
 From `D:/Data_Science/autoresearch`:
 
 ```powershell
-.\.venv\Scripts\python.exe -m autoresearch.cli --config competitions\rogii-wellbore-geology-prediction\config.yaml limit-status
-.\.venv\Scripts\python.exe -m autoresearch.cli --config competitions\rogii-wellbore-geology-prediction\config.yaml check-submission <submission.csv>
+scripts\runtime_python.cmd -m autoresearch.cli --config competitions\rogii-wellbore-geology-prediction\config.yaml limit-status
+scripts\runtime_python.cmd -m autoresearch.cli --config competitions\rogii-wellbore-geology-prediction\config.yaml check-submission <submission.csv>
+scripts\runtime_python.cmd competitions\rogii-wellbore-geology-prediction\workspace\scripts\rogii_autonomous_loop.py --mode bootstrap --python C:\Users\doran\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
 ```
 
 Historical scripts remain available under `workspace/scripts/`. Prefer reproducing a small, leak-safe OOF experiment before submitting anything new.

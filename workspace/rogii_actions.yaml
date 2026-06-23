@@ -57,3 +57,11 @@ actions:
     timeout_minutes: 30
     description: Historical final PF/geom blend reproduction.
     args: {}
+  public_lb71_intake:
+    script: scripts/exp095_public_lb71_intake.py
+    timeout_minutes: 10
+    description: Audit pulled LB 7.1 public notebooks and group source families.
+    args:
+      exp-id:
+        type: string
+        default: exp095_public_lb71_intake

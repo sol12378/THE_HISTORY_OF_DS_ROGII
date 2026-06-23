@@ -20,10 +20,19 @@ $PidPath = Join-Path $LogDir "rogii_controller_$Stamp.pid"
 $HeartbeatPath = Join-Path $LogDir "rogii_monitor_latest.json"
 $StopPath = Join-Path $LogDir "STOP_ROGII_CONTROLLER"
 
+$PythonRoot = Split-Path -Parent $PythonExe
+$env:PATH = "$PythonRoot;$PythonRoot\DLLs;C:\Windows\System32;C:\Windows"
 $env:PYTHONPATH = "$RepoRoot\src;$Workspace\src;$RepoRoot\.venv\Lib\site-packages"
 $env:PYTHONUNBUFFERED = "1"
 $env:PYTHONIOENCODING = "utf-8"
 $env:ROGII_RAW_DIR = "D:\Data_Science\data\rogii-wellbore-geology-prediction\raw"
+
+# --- 資源ガバナの thread env を取り込む（OMP/BLAS + VRAM no-spill）。doc §8.2 / governed_launch ---
+# 起動する python が lease の CPU 数（rogii の標準 lease）に揃った env を継承する。
+try {
+  $govEnv = & $PythonExe -m autoresearch.orchestration.thread_env --comp rogii-wellbore-geology-prediction
+  if ($LASTEXITCODE -eq 0 -and $govEnv) { $govEnv | ForEach-Object { Invoke-Expression $_ } }
+} catch { Write-Host "[governed] thread_env 取り込みをskip: $_" }
 
 function Log([string]$msg) {
     $line = "[$(Get-Date -Format o)] $msg"

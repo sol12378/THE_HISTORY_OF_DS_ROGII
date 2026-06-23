@@ -1,5 +1,5 @@
 schema_version: 1
-updated: 2026-06-20
+updated: 2026-06-21
 competition: rogii-wellbore-geology-prediction
 
 hypotheses:
@@ -17,7 +17,7 @@ hypotheses:
     status: open
   - id: H4
     text: "Imported public notebook artifacts may improve LB, but they need OOF reconstruction, per-well attribution, and leakage classification before becoming a trusted base."
-    evidence: [exp073_public_assets_integration, LB_Tracking, exp080_sp45_fork]
+    evidence: [exp073_public_assets_integration, LB_Tracking, exp080_sp45_fork, exp090_lightningv08_lb7168, exp091_baidalinadilzhan_lb7201, exp092_dual_pipeline_v16, exp093_public_rebuild_lb7295, exp094_public_gold_fallback]
     status: open
 
 focus:
@@ -54,3 +54,5 @@ submission_policy:
   require_cv_lb_consistency: true
   require_leakage_classification: true
   require_submission_gate: true
+  minimum_submission_baseline_lb: 7.1
+  current_public_reference_lb: 7.168

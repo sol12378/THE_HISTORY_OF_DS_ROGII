@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "updated": "2026-06-21",
+  "competition": "rogii-wellbore-geology-prediction",
+  "submission_floor_lb": 7.1,
+  "notes": "These public Kaggle notebooks define the new LB 7.1-family reference set. Sources were pulled through the Kaggle legacy /kernels/pull endpoint using curl --ssl-no-revoke, then expanded into .ipynb, .py, and kernel-metadata.json files.",
+  "notebooks": [
+    {
+      "exp_id": "exp090_lightningv08_lb7168",
+      "url": "https://www.kaggle.com/code/lightningv08/rogii-lb-7-168",
+      "kernel": "lightningv08/rogii-lb-7-168",
+      "reported_lb": 7.168,
+      "local_dir": "workspace/kaggle_notebooks/exp090_lightningv08_lb7168",
+      "status": "pulled_extracted",
+      "notebook_file": "rogii-lb-7-168.ipynb",
+      "script_file": "rogii-lb-7-168.py",
+      "script_sha256": "3A3C0678C8B946C7F5196F11E3DD5C1803420BA201E21585E3EAF5534A801DB7",
+      "equivalence_group": "A"
+    },
+    {
+      "exp_id": "exp091_baidalinadilzhan_lb7201",
+      "url": "https://www.kaggle.com/code/baidalinadilzhan/rogii-lb-7-201",
+      "kernel": "baidalinadilzhan/rogii-lb-7-201",
+      "reported_lb": 7.201,
+      "local_dir": "workspace/kaggle_notebooks/exp091_baidalinadilzhan_lb7201",
+      "status": "pulled_extracted",
+      "notebook_file": "rogii-lb-7-201.ipynb",
+      "script_file": "rogii-lb-7-201.py",
+      "script_sha256": "1A22CD22326FA706FDDAB4F8C7D808C9AAF16F75F69973BB4A42EF9666E4368F",
+      "equivalence_group": "B"
+    },
+    {
+      "exp_id": "exp092_kokinnwakashuu_dual_pipeline_v16",
+      "url": "https://www.kaggle.com/code/kokinnwakashuu/rogii-dual-pipeline-v16",
+      "kernel": "kokinnwakashuu/rogii-dual-pipeline-v16",
+      "reported_lb": null,
+      "reported_family": "LB 7.1 vicinity",
+      "local_dir": "workspace/kaggle_notebooks/exp092_kokinnwakashuu_dual_pipeline_v16",
+      "status": "pulled_extracted",
+      "notebook_file": "rogii-dual-pipeline-v16.ipynb",
+      "script_file": "rogii-dual-pipeline-v16.py",
+      "script_sha256": "63F8DC70B5617F9681D9C0F35BFEE031529A4E97DD421783F79A78AEB370EEC5",
+      "equivalence_group": "C"
+    },
+    {
+      "exp_id": "exp093_curvecowboy_lb7295_public_rebuild",
+      "url": "https://www.kaggle.com/code/curvecowboy/rogii-lb7295-public-rebuild-submit",
+      "kernel": "curvecowboy/rogii-lb7295-public-rebuild-submit",
+      "reported_lb": 7.295,
+      "local_dir": "workspace/kaggle_notebooks/exp093_curvecowboy_lb7295_public_rebuild",
+      "status": "pulled_extracted",
+      "notebook_file": "rogii-lb7295-public-rebuild-submit.ipynb",
+      "script_file": "rogii-lb7295-public-rebuild-submit.py",
+      "script_sha256": "3A3C0678C8B946C7F5196F11E3DD5C1803420BA201E21585E3EAF5534A801DB7",
+      "equivalence_group": "A"
+    },
+    {
+      "exp_id": "exp094_omprakashpy_public_gold_fallback",
+      "url": "https://www.kaggle.com/code/omprakashpy/rogii-public-gold-fallback",
+      "kernel": "omprakashpy/rogii-public-gold-fallback",
+      "reported_lb": null,
+      "reported_family": "LB 7.1 vicinity",
+      "local_dir": "workspace/kaggle_notebooks/exp094_omprakashpy_public_gold_fallback",
+      "status": "pulled_extracted",
+      "notebook_file": "rogii-public-gold-fallback.ipynb",
+      "script_file": "rogii-public-gold-fallback.py",
+      "script_sha256": "1A22CD22326FA706FDDAB4F8C7D808C9AAF16F75F69973BB4A42EF9666E4368F",
+      "equivalence_group": "B"
+    }
+  ]
+}

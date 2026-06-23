@@ -58,8 +58,10 @@ workspace:
   inherited_path: "workspace"
   experiment_index: "workspace/ROGII_kaggle_obsidian/05_Experiments/EXP_Index.md"
   lb_tracking: "workspace/ROGII_kaggle_obsidian/09_Submissions/LB_Tracking.md"
-  best_known_lb: 7.625
-  best_known_source: "exp080 sp45-fleongg fork"
+  best_known_lb: 7.168
+  best_known_source: "exp090 lightningv08/rogii-lb-7-168"
+  minimum_submission_baseline_lb: 7.1
+  public_notebook_registry: "workspace/kaggle_notebooks/public_lb71_registry.json"
 
 llm:
   base_url: "http://localhost:8000/v1"
